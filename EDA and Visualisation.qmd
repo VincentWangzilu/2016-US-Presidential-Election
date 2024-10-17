@@ -1,0 +1,1532 @@
+---
+title: "Assessing the Impact of Socio-economic Factors on Presidential Election Voting in the USA in 2016"
+author: 
+  name: Zilu Wang
+  affiliation: University of Glasgow
+number-sections: true
+format: 
+  html:
+    embed-resources: true
+    code-tools: true
+  pdf: 
+    documentclass: article
+    fontsize: 11pt
+    geometry: margin=1in
+    linestretch: 1.5
+    keep-tex: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-caption: true
+editor_options: 
+  chunk_output_type: console
+execute:
+  echo: false
+  eval: true
+  warning: false
+  message: false
+---
+
+# Introduction {#sec-intro}
+
+The 2016 USA presidential election is one of the most dramatic and surprising elections in the US history. As a result, Republican nominee Donald Trump won the presidency with 304 electoral votes, compared to Democratic nominee Hillary Clinton’s 227 electoral votes. Trump became the first president without prior political or military experience. Additionally, he became the fifth president to win the presidency despite losing the popular vote, given that he received almost 3 million votes less than Hillary Clinton.
+
+Donal Trump was known for his controversial statements and policies, which appealed to a significant portion of the American population. His victory in the 2016 election raised questions about the factors that influenced the voting patterns of the American electorate. In this analysis, we aim to explore the relationship between socio-economic factors and voting patterns in the 2016 presidential election. We will investigate how demographic, economic, and educational indicators at the county level may have influenced the voting outcomes in the election.
+
+For better understanding of this paper, a brief summary of how US election works is provided. The U.S. presidential election is an indirect election where voters cast ballots for a slate of members of the Electoral College; these electors then directly vote for the President and Vice President. Each state is allocated a number of electors equal to its total number of Senators and Representatives in Congress, resulting in a total of 538 electors in the Electoral College. Most states have a "winner-takes-all" system where the candidate who receives the most popular votes in that state wins all its electoral votes. A candidate needs a majority of 270 electoral votes to win the presidency. The Electoral College system has been a subject of debate, as it is possible for a candidate to win the presidency without winning the popular vote, as was the case in the 2016 election.
+
+The main datasets used in this project include the 2016 US presidential election results data, and the 2014 socio-economic data from the US Census Bureau. The election results dataset contains information on the number of votes received by each candidate in each county, the total number of votes, and the fraction of votes received by the Republican candidate. The demographic and socio-economic indicators dataset contains information on various indicators such as population, racial demographics, educational attainment, and median household income for each county. The dictionary dataset provides descriptions of the columns in the demographic and socio-economic indicators dataset.
+
+There are three main research questions that we aim to address in this analysis:
+1. Are there specific socio-economic or demographic factors that are associated with an increased or decreased preference for a political party, in a county?
+2. Are there state-wide factors that are associated with a preference for one political party over another?
+3. How well can the model associating socioeconomic factors with 2016 election results be used to predict the final state-wide outcome of the presidential elections in 2016?
+
+The analysis will be conducted in several stages, including data inspection and pre-processing, exploratory data analysis, and predictive modeling. Various statistical and machine learning techniques will be applied to explore the relationship between socio-economic factors and voting patterns in the 2016 presidential election. The results of this analysis will provide insights into the factors that may have influenced the voting outcomes in the 2016 election and contribute to a better understanding of the dynamics of US presidential elections.
+
+# Methodology {#sec-methodology}
+
+
+
+```{r import libraries, message=FALSE, warning=FALSE}
+# import libraries and data
+library(tidyverse)
+library(ggplot2)
+library(gt)
+library(maps)
+library(mapdata)
+library(reshape2)
+library(usmap)
+library(gridExtra)
+library(broom)
+library(caret)
+library(corrplot)
+library(factoextra)
+library(rpart)
+library(rpart.plot)
+library(pROC)
+```
+
+```{r import datasets, message=FALSE, warning=FALSE}
+# read data files
+## Read datasets
+PresElect2016R <- read_csv("PresElect2016R copy.csv")
+UScounty_facts <- read_csv("UScounty-facts.csv", locale = locale(encoding = "ISO-8859-1"))
+dictionary <- read_csv("UScounty-dictionary.csv")
+
+# Rename columns in PresElect2016R
+votes_by_county <- PresElect2016R |>
+  rename(
+    state = state,
+    state.po = state.po,
+    county = county,
+    fips = FIPS,
+    votesR = candidatevotesR,
+    votesD = candidatevotesD, 
+    fracR = fracvotesR
+  )
+
+#Add columns fracD, totalvotes, winning_party to the votes_by_county dataframe.
+votes_by_county <- votes_by_county |>
+  mutate(
+    fracD = votesD / totalvotes,
+    frac_diff = abs(fracR - fracD),
+    totalvotes = votesR + votesD,
+    winning_party = ifelse(fracR > fracD, "Republican", "Democratic")
+  )
+
+votes_by_state <- votes_by_county %>%
+  group_by(state, state.po) %>%
+  summarise(
+    totalvotes = sum(totalvotes, na.rm = TRUE),
+    votesR = sum(votesR, na.rm = TRUE),
+    votesD = sum(votesD, na.rm = TRUE),
+    fracR = votesR / totalvotes,
+    fracD = votesD / totalvotes,
+    frac_diff = abs(fracR - fracD), 
+    partywonR = ifelse(votesR > votesD, 1, 0),
+    winning_party = if_else(fracR > fracD, "Republican", "Democratic")
+  )
+
+state_facts <- UScounty_facts |>
+  filter(is.na(state_abbreviation)) |>
+  rename(state = area_name) |>
+  select(-state_abbreviation, -fips)
+
+county_facts <- UScounty_facts |>
+  filter(!is.na(state_abbreviation)) |>
+  rename(county = area_name)
+
+state_facts$state <- ifelse(state_facts$state == "District Of Columbia", "District of Columbia", state_facts$state)
+merged_data_state <- merge(votes_by_state, state_facts, by = "state")
+merged_data_state <- merge(merged_data_state, state_info, by = "state") |>
+  select(-region)
+merged_data_state$winning_party <- as.factor(merged_data_state$winning_party)
+
+# Merge votes_by_county with county_facts by fips
+merged_data_county <- left_join(votes_by_county, county_facts, by = "fips") 
+merged_data_county <- merged_data_county |>
+  filter(complete.cases(county.y)) |>
+  select(-county.y, -state_abbreviation) |>
+  rename(county = county.x)
+merged_data_county$winning_party <- as.factor(merged_data_county$winning_party)
+
+# merge merged_data_county with state_info by state
+merged_data_county <- merge(merged_data_county, state_info, by = "state") |>
+  select(-region)
+```
+
+## Exploratory Data Analysis {#sec-eda}
+
+### Data Inspection and Pre-processing {#sec-eda-inspection}
+
+```{r dataset overview}
+# print the first 5 rows of the PresElect2016R dataset
+head(PresElect2016R)
+
+# print the first 5 rows of the UScounty_facts dataset
+head(UScounty_facts)
+```
+
+The first thing we need to check is whether there is any missing data in the datasets.
+
+```{r missing data}
+# Check for missing values in the PresElect2016R dataset
+colSums(is.na(PresElect2016R))
+
+# Check for missing values in the UScounty_facts dataset
+colSums(is.na(UScounty_facts))
+```
+
+There is no missing value in the `PresElect2016R` dataset. However, there are 51 missing values in the `state_abbreviation` column in the `UScounty_facts` dataset. Now we select these rows with missing values to see the detail.
+
+```{r select rows with missing value}
+# select rows with missing values in the UScounty_facts dataset
+UScounty_facts[!complete.cases(UScounty_facts), ]
+```
+
+We see that these rows with missing value in the column `state_abbreviation` contain the data of demographic and socio-econimic indicators for each state. We will separate the data into two datasets: one for the states and the other for the counties.
+
+```{r county and state facts}
+glimpse(state_facts)
+glimpse(county_facts)
+```
+
+Next, we need to check the dimensions of the datasets.
+
+```{r dataset dimension}
+# Check the dimensions of the datasets
+dim(PresElect2016R)
+dim(county_facts)
+```
+
+We can see that these two datasets do not have the same number of rows. We need to find out if there exist counties listed in one file may or may not appear in the other.
+
+```{r}
+# Find FIPS codes in PresElect2016R but not in UScounty_facts
+fips_in_election_not_in_facts <- setdiff(PresElect2016R$FIPS, county_facts$fips)
+
+# Find FIPS codes in UScounty_facts but not in PresElect2016R
+fips_in_facts_not_in_election <- setdiff(county_facts$fips, PresElect2016R$FIPS)
+
+# Get county names for FIPS codes in PresElect2016R but not in UScounty_facts
+counties_in_election_not_in_facts <- PresElect2016R %>% 
+  filter(FIPS %in% fips_in_election_not_in_facts) %>% 
+  select(FIPS, county, state)
+
+# Get county names for FIPS codes in UScounty_facts but not in PresElect2016R
+counties_in_facts_not_in_election <- county_facts %>% 
+  filter(fips %in% fips_in_facts_not_in_election) %>% 
+  select(fips, county, state_abbreviation)
+
+# Print the Counties in PresElect2016R but not in UScounty_facts
+print(counties_in_election_not_in_facts)
+print(counties_in_facts_not_in_election)
+```
+
+### Statistical Summary {#sec-eda-summary}
+
+```{r}
+# Rename columns in PresElect2016R
+votes_by_county <- PresElect2016R |>
+  rename(
+    state = state,
+    state.po = state.po,
+    county = county,
+    fips = FIPS,
+    votesR = candidatevotesR,
+    votesD = candidatevotesD, 
+    fracR = fracvotesR
+  )
+
+#Add columns fracD, totalvotes, winning_party to the votes_by_county dataframe.
+votes_by_county <- votes_by_county |>
+  mutate(
+    fracD = votesD / totalvotes,
+    frac_diff = abs(fracR - fracD),
+    totalvotes = votesR + votesD,
+    winning_party = ifelse(fracR > fracD, "Republican", "Democratic")
+  )
+
+votes_by_state <- votes_by_county %>%
+  group_by(state, state.po) %>%
+  summarise(
+    totalvotes = sum(totalvotes, na.rm = TRUE),
+    votesR = sum(votesR, na.rm = TRUE),
+    votesD = sum(votesD, na.rm = TRUE),
+    fracR = votesR / totalvotes,
+    fracD = votesD / totalvotes,
+    frac_diff = abs(fracR - fracD), 
+    partywonR = ifelse(votesR > votesD, 1, 0),
+    winning_party = if_else(fracR > fracD, "Republican", "Democratic")
+  )
+
+# Create a dataframe with the number of electoral seats for each state
+electoral_seats <- tibble::tibble(
+  state = c("Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", 
+            "Connecticut", "Delaware", "District of Columbia", "Florida", "Georgia", 
+            "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", 
+            "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota", 
+            "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire", 
+            "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota", 
+            "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island", "South Carolina", 
+            "South Dakota", "Tennessee", "Texas", "Utah", "Vermont", "Virginia", 
+            "Washington", "West Virginia", "Wisconsin", "Wyoming"),
+  
+  electoral_votes = c(9, 3, 11, 6, 55, 9, 7, 3, 3, 29, 16, 4, 4, 20, 11, 6, 6, 8, 8, 4, 
+                      10, 11, 16, 10, 6, 10, 3, 5, 6, 4, 14, 5, 29, 15, 3, 18, 7, 7, 20, 
+                      4, 9, 3, 11, 38, 6, 3, 13, 12, 5, 10, 3)
+)
+
+votes_by_state <- votes_by_state %>%
+  left_join(electoral_seats, by = "state")
+
+# Merge county level dataset
+merged_data_county <- left_join(votes_by_county, county_facts, by = c("fips" = "fips"))
+merged_data_county <- merged_data_county[complete.cases(merged_data_county), ]
+
+# Mutate the DC name
+state_facts$state <- ifelse(state_facts$state == "District Of Columbia", "District of Columbia", merged_data_county$state)
+# Merge state level dataset
+merged_data_state <- left_join(votes_by_state, state_facts, by = c("state" = "state"))
+# select rows with missing value
+merged_data_state[!complete.cases(merged_data_state), ]
+
+```
+
+```{r summary table, message=FALSE, warning=FALSE}
+#| label: tbl-result-summary
+#| tbl_cap: Results Summary of 2016 US Presidential Election
+
+# Load necessary library
+library(dplyr)
+
+# Calculate total votes received by Republicans and Democrats
+total_votes_R <- sum(votes_by_state$votesR)
+total_votes_D <- sum(votes_by_state$votesD)
+total_votes <- total_votes_R + total_votes_D
+
+# Calculate percentage of votes received by Republicans and Democrats
+percent_votes_R <- (total_votes_R / total_votes) 
+percent_votes_D <- (total_votes_D / total_votes) 
+
+# Calculate total counties won by Republicans and Democrats
+total_counties_R <- sum(votes_by_county$partywonR)
+total_counties_D <- nrow(votes_by_county) - total_counties_R
+total_counties <- nrow(votes_by_county)
+
+# Calculate percentage of counties won by Republicans and Democrats
+percent_counties_R <- (total_counties_R / total_counties) 
+percent_counties_D <- (total_counties_D / total_counties) 
+
+# Calculate total states won by Republicans and Democrats
+total_states_R <- sum(votes_by_state$partywonR)
+total_states_D <- nrow(votes_by_state) - total_states_R
+total_states <- nrow(votes_by_state)
+
+# Calculate percentage of states won by Republicans and Democrats
+percent_states_R <- (total_states_R / total_states) 
+percent_states_D <- (total_states_D / total_states) 
+
+# Calculate total electoral votes won by Republicans and Democrats
+total_electoral_votes_R <- sum(votes_by_state$partywonR * votes_by_state$electoral_votes)
+total_electoral_votes_D <- sum((1 - votes_by_state$partywonR) * votes_by_state$electoral_votes)
+
+# Calculate percentage of electoral votes won by Republicans and Democrats
+percent_electoral_votes_R <- ((total_electoral_votes_R+1) / sum(votes_by_state$electoral_votes)) 
+percent_electoral_votes_D <- ((total_electoral_votes_D-1) / sum(votes_by_state$electoral_votes)) 
+
+# Create the final summary table
+summary_table <- tibble::tibble(
+  Category = c("Total votes received", "Number of counties won", "Number of states won", "Electoral votes"),
+  Republican = c(total_votes_R, total_counties_R, total_states_R, total_electoral_votes_R + 1),
+  Democratic = c(total_votes_D, total_counties_D, total_states_D, total_electoral_votes_D - 1),
+  `Republican %` = c(percent_votes_R, percent_counties_R, percent_states_R, percent_electoral_votes_R),
+  `Democratic %` = c(percent_votes_D, percent_counties_D, percent_states_D, percent_electoral_votes_D),
+  Total = c(total_votes, total_counties, total_states, sum(votes_by_state$electoral_votes))
+)
+
+# Display the summary table
+summary_table |> 
+  mutate(`Republican %` = 100 * `Republican %`, `Democratic %` = 100 * `Democratic %`) |>
+  gt() |>
+  tab_header(title = "Summary of 2016 Presidential Election Results") |>
+  tab_spanner(
+    label = "Votes Received",
+    columns = vars(Republican, Democratic)
+  ) |>
+  tab_spanner(
+    label = "Votes Share",
+    columns = vars(`Republican %`, `Democratic %`)
+  ) |>
+  fmt_number(
+    columns = vars(Republican, Democratic, Total),
+    decimals = 0,
+    use_seps = TRUE
+  ) |>
+  fmt_number(
+    columns = vars(`Republican %`, `Democratic %`),
+    decimals = 2)
+
+```
+
+There are in total of 238,828,200 registered votes, with turnout rate of 54.8%, meaning 54.8% of people age 18 or above voted in this election. The Democratic party received almost 3 million more votes than the Republican party, with 65,840,274 votes (51.11%) compared to 62,977,826 votes (48.89%). Despite this, the Republican party won a significantly higher number of counties, with 2,634 counties (83.86%) favoring them, while only 507 counties (16.14%) favored the Democratic party. In terms of state victories, the Republicans secured 30 states (58.82%), while the Democrats won 21 states (41.18%). This resulted in the Republican party gaining more electoral votes, with 306 (56.69%) compared to the Democratic party's 232 electoral votes (43.31%), ultimately leading to their victory in the 2016 Presidential Election.
+
+```{r}
+votes_by_state <- ungroup(votes_by_state)
+
+votes_by_state |>
+  dplyr::select(state, votesR, votesD, fracR, fracD, winning_party) |>
+  mutate(fracR = 100 * fracR, fracD = 100 * fracD) |>
+  gt() |>
+  tab_header(title = "2016 Presidential Election Voting Results by State") |>
+  tab_spanner(
+    label = "Votes Received",
+    columns = vars(votesR, votesD)
+  ) |>
+  tab_spanner(
+    label = "Vote Share",
+    columns = vars(fracR, fracD)
+  ) |>
+  cols_label(
+    state = "State",
+    votesR = "Republican",
+    votesD = "Democratic",
+    fracR = "Republican %",
+    fracD = "Democratic %",
+    winning_party = "Winner"
+  ) |>
+  fmt_number(
+    columns = vars( fracR, fracD),
+    decimals = 2
+  ) |>
+  fmt_number(
+    columns = vars(votesR, votesD),
+    decimals = 0,
+    use_seps = TRUE
+  )
+  
+```
+
+First, let's see what counties has the highest Republican vote share and Democratic vote share.
+
+```{r}
+#| label: tbl-top5R
+#| tbl_cap: Top 5 Counties with Highest Republican Vote Share
+
+votes_by_county |>
+  arrange(desc(fracR)) |>
+  dplyr::select(county, state, fracR) |>
+  slice_head(n = 5) |>
+  gt() |>
+  tab_header(title = "Top 5 Counties with Highest Republican Vote Share") |>
+  cols_label(
+    state = "State",
+    county = "County",
+    fracR = "Republican Vote Share"
+  ) |>
+  fmt_number(
+    columns = vars(fracR),
+    decimals = 3
+  )
+```
+
+4 out of the 5 counties with highest Republican vote share are in Texas.
+
+```{r}
+#| label: tbl-top5D
+#| tbl_cap: Top 5 Counties with Highest Democratic Vote Share
+
+votes_by_county |>
+  arrange(desc(fracD)) |>
+  select(county, state, fracD) |>
+  slice_head(n = 5) |>
+  gt() |>
+  tab_header(title = "Top 5 Counties with Highest Democratic Vote Share") |>
+  cols_label(
+    state = "State",
+    county = "County",
+    fracD = "Democratic Vote Share"
+  ) |>
+  fmt_number(
+    columns = vars(fracD),
+    decimals = 3
+  )
+```
+
+```{r}
+library(dplyr)
+
+# Ensure winning_party is a factor for easier aggregation
+model_data <- merged_data_county %>%
+  mutate(winning_party = as.factor(winning_party))
+
+# Multiply the percentage variables by the corresponding population
+model_data <- model_data %>%
+  mutate(
+    EDU685213_weighted = EDU685213 * PST045214,
+    RHI825214_weighted = RHI825214 * PST045214,
+    POP645213_weighted = POP645213 * PST045214, 
+    SEX255214_weighted = SEX255214 * PST045214
+  )
+
+# Aggregate the data by winning_party
+aggregated_data <- model_data %>%
+  group_by(winning_party) %>%
+  summarise(
+    total_population = sum(PST045214, na.rm = TRUE),
+    HSG495213_avg = mean(HSG495213, na.rm = TRUE),
+    INC910213_avg = mean(INC910213, na.rm = TRUE),
+    EDU685213_weighted_sum = sum(EDU685213_weighted, na.rm = TRUE),
+    RHI825214_weighted_sum = sum(RHI825214_weighted, na.rm = TRUE),
+    POP645213_weighted_sum = sum(POP645213_weighted, na.rm = TRUE), 
+    SEX255214_weighted_sum = sum(SEX255214_weighted, na.rm = TRUE)
+  )
+
+# Calculate the average values for the percentage variables
+aggregated_data <- aggregated_data %>%
+  mutate(
+    EDU685213_avg = EDU685213_weighted_sum / total_population,
+    RHI825214_avg = RHI825214_weighted_sum / total_population,
+    POP645213_avg = POP645213_weighted_sum / total_population, 
+    SEX255214_avg = SEX255214_weighted_sum / total_population
+  ) %>%
+  dplyr::select(
+    winning_party,
+    HSG495213_avg,
+    INC910213_avg,
+    EDU685213_avg,
+    RHI825214_avg,
+    POP645213_avg, 
+    SEX255214_avg
+  )
+
+# Print the summarized table
+aggregated_data |>
+  gt() |>
+  tab_header(title = "Average Socio-Economic Indicators of Counties by Favouring Party") |>
+  cols_label(
+    winning_party = "Favouring Party",
+    HSG495213_avg = "Median House Value",
+    INC910213_avg = "Income per capita",
+    EDU685213_avg = "Bachelor's Degree Pct",
+    RHI825214_avg = "White Population Pct",
+    POP645213_avg = "Population Density", 
+    SEX255214_avg = "Women Pct"
+  ) |>
+  fmt_number(
+    columns = vars(HSG495213_avg, INC910213_avg, EDU685213_avg, RHI825214_avg, POP645213_avg, SEX255214_avg),
+    decimals = 2
+  )
+
+```
+
+```{r}
+library(dplyr)
+
+# Ensure winning_party is a factor for easier aggregation
+model_data <- merged_data_state %>%
+  mutate(winning_party = as.factor(winning_party))
+
+# Check for any NAs in winning_party
+print(sum(is.na(model_data$winning_party)))
+
+# Print unique values in winning_party
+print(unique(model_data$winning_party))
+
+# Multiply the percentage variables by the corresponding population
+model_data <- model_data %>%
+  mutate(
+    EDU685213_weighted = EDU685213 * PST045214,
+    RHI825214_weighted = RHI825214 * PST045214,
+    POP645213_weighted = POP645213 * PST045214, 
+    SEX255214_weighted = SEX255214 * PST045214
+  )
+
+# Check for any infinite values
+print(colSums(sapply(model_data, is.infinite)))
+
+# Aggregate the data by winning_party
+aggregated_data <- model_data %>%
+  group_by(winning_party) %>%
+  summarise(
+    total_population = sum(PST045214, na.rm = TRUE),
+    HSG495213_avg = mean(HSG495213, na.rm = TRUE),
+    INC910213_avg = mean(INC910213, na.rm = TRUE),
+    EDU685213_weighted_sum = sum(EDU685213_weighted, na.rm = TRUE),
+    RHI825214_weighted_sum = sum(RHI825214_weighted, na.rm = TRUE),
+    POP645213_weighted_sum = sum(POP645213_weighted, na.rm = TRUE), 
+    SEX255214_weighted_sum = sum(SEX255214_weighted, na.rm = TRUE)
+  )
+
+# Calculate the average values for the percentage variables
+aggregated_data <- aggregated_data %>%
+  mutate(
+    EDU685213_avg = EDU685213_weighted_sum / total_population,
+    RHI825214_avg = RHI825214_weighted_sum / total_population,
+    POP645213_avg = POP645213_weighted_sum / total_population, 
+    SEX255214_avg = SEX255214_weighted_sum / total_population
+  ) %>%
+  dplyr::select(
+    winning_party,
+    HSG495213_avg,
+    INC910213_avg,
+    EDU685213_avg,
+    RHI825214_avg,
+    POP645213_avg, 
+    SEX255214_avg
+  )
+
+# Print the summarized table
+aggregated_data %>%
+  gt() %>%
+  tab_header(title = "Average Socio-Economic Indicators of States by Favouring Party") %>%
+  cols_label(
+    winning_party = "Favouring Party",
+    HSG495213_avg = "Median House Value",
+    INC910213_avg = "Income per capita",
+    EDU685213_avg = "Bachelor's Degree Pct",
+    RHI825214_avg = "White Population Pct",
+    POP645213_avg = "Population Density", 
+    SEX255214_avg = "Women Pct"
+  ) %>%
+  fmt_number(
+    columns = vars(HSG495213_avg, INC910213_avg, EDU685213_avg, RHI825214_avg, POP645213_avg, SEX255214_avg),
+    decimals = 2
+  )
+```
+
+```{r}
+# Ensure winning_party is a factor for easier aggregation
+model_data <- merged_data_state %>%
+  mutate(winning_party = as.factor(winning_party))
+
+# Calculate weighted values for percentage variables
+percentage_vars <- c("AGE135214", "AGE295214", "AGE775214", "SEX255214", "RHI125214", "RHI225214", 
+                     "RHI325214", "RHI425214", "RHI525214", "RHI625214", "RHI725214", "RHI825214", 
+                     "POP715213", "POP645213", "POP815213", "EDU635213", "EDU685213", "HSG096213", 
+                     "PVY020213", "SBO315207", "SBO115207", "SBO215207", "SBO515207", "SBO415207", "SBO015207")
+
+model_data <- model_data %>%
+  mutate(across(all_of(percentage_vars), ~ . * PST045214, .names = "{.col}_weighted"))
+
+# Aggregate the data by winning_party
+aggregated_data <- model_data %>%
+  group_by(winning_party) %>%
+  summarise(
+    total_population = sum(PST045214, na.rm = TRUE),
+    across(c(HSG495213, INC910213, INC110213, MAN450207, WTN220207, RTN130207, RTN131207, AFN120207, BPS030214), 
+           ~ mean(., na.rm = TRUE), .names = "{.col}_avg"),
+    across(ends_with("_weighted"), ~ sum(., na.rm = TRUE), .names = "{.col}_sum"),
+    across(c(PST120214, VET605213, LFE305213, HSG010214, HSG445213, HSD410213, HSD310213, 
+             BZA010213, BZA110213, BZA115213, NES010213, SBO001207, LND110210, POP060210), 
+           ~ mean(., na.rm = TRUE), .names = "{.col}_avg")
+  )
+
+# Calculate the average values for the percentage variables
+aggregated_data <- aggregated_data %>%
+  mutate(across(ends_with("_weighted_sum"), 
+                ~ . / total_population, 
+                .names = "{str_remove(.col, '_weighted_sum')}_avg"))
+
+# Select and rename columns
+aggregated_data <- aggregated_data %>%
+  dplyr::select(winning_party, ends_with("_avg"), total_population) %>%
+  rename_with(~ str_remove(.x, "_avg"), ends_with("_avg"))
+
+# Print the summarized table
+aggregated_data %>%
+  gt() %>%
+  tab_header(title = "Average Socio-Economic Indicators of Counties by Favouring Party") %>%
+  fmt_number(columns = -winning_party, decimals = 2)
+```
+
+```{r}
+# Ensure winning_party is a factor for easier aggregation
+model_data <- merged_data_county %>%
+  mutate(winning_party = as.factor(winning_party))
+
+# Calculate weighted values for percentage variables
+percentage_vars <- c("AGE135214", "AGE295214", "AGE775214", "SEX255214", "RHI125214", "RHI225214", 
+                     "RHI325214", "RHI425214", "RHI525214", "RHI625214", "RHI725214", "RHI825214", 
+                     "POP715213", "POP645213", "POP815213", "EDU635213", "EDU685213", "HSG096213", 
+                     "PVY020213", "SBO315207", "SBO115207", "SBO215207", "SBO515207", "SBO415207", "SBO015207")
+
+model_data <- model_data %>%
+  mutate(across(all_of(percentage_vars), ~ . * PST045214, .names = "{.col}_weighted"))
+
+# Aggregate the data by winning_party
+aggregated_data <- model_data %>%
+  group_by(winning_party) %>%
+  summarise(
+    total_population = sum(PST045214, na.rm = TRUE),
+    across(c(HSG495213, INC910213, INC110213, MAN450207, WTN220207, RTN130207, RTN131207, AFN120207, BPS030214), 
+           ~ mean(., na.rm = TRUE), .names = "{.col}_avg"),
+    across(ends_with("_weighted"), ~ sum(., na.rm = TRUE), .names = "{.col}_sum"),
+    across(c(PST120214, VET605213, LFE305213, HSG010214, HSG445213, HSD410213, HSD310213, 
+             BZA010213, BZA110213, BZA115213, NES010213, SBO001207, LND110210, POP060210), 
+           ~ mean(., na.rm = TRUE), .names = "{.col}_avg")
+  )
+
+# Calculate the average values for the percentage variables
+aggregated_data <- aggregated_data %>%
+  mutate(across(ends_with("_weighted_sum"), 
+                ~ . / total_population, 
+                .names = "{str_remove(.col, '_weighted_sum')}_avg"))
+
+# Select and rename columns
+aggregated_data <- aggregated_data %>%
+  dplyr::select(winning_party, ends_with("_avg"), total_population) %>%
+  rename_with(~ str_remove(.x, "_avg"), ends_with("_avg"))
+
+# Print the summarized table
+aggregated_data %>%
+  gt() %>%
+  tab_header(title = "Average Socio-Economic Indicators of Counties by Favouring Party") %>%
+  fmt_number(columns = -winning_party, decimals = 2)
+```
+
+### Visualisation {#sec-eda-visualisation}
+#### Win margin for state
+```{r}
+#| label: fig-vote-share-state
+#| fig_cap: Vote Share by State for 2016 Presidential Election
+library(scales)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Prepare the data
+plot_data <- votes_by_state %>%
+  select(state, fracR, fracD) %>%
+  pivot_longer(cols = c(fracR, fracD), 
+               names_to = "party", 
+               values_to = "vote_share") %>%
+  mutate(party = ifelse(party == "fracR", "Republican", "Democratic"))
+
+# Create the plot
+ggplot(plot_data, aes(y = reorder(state, vote_share), x = vote_share, fill = party)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.8) +
+  scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+  scale_x_continuous(labels = percent_format()) +
+  labs(title = "2016 Presidential Election Vote Share by State",
+       y = "State",
+       x = "Vote Share",
+       fill = "Party") +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "black") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8),
+        legend.position = "bottom")
+```
+#### winning party map
+```{r}
+#| label: fig-winners-state
+#| fig_cap: Winners by State for 2016 Presidential Election
+#| 
+# Visualise the winning party at the state level on a US map
+# Prepare the data
+votes_by_state_map <- votes_by_state %>%
+  mutate(winning_party_color = ifelse(winning_party == "Republican", "red", "blue"),
+         color_intensity = scales::rescale(frac_diff, to = c(0.3, 2)))
+
+# Function to generate color based on party and intensity
+get_color <- function(party, intensity) {
+  if (party == "red") {
+    return(scales::alpha("red", intensity))
+  } else {
+    return(scales::alpha("blue", intensity))
+  }
+}
+
+# Apply the function to get the color
+votes_by_state_map <- votes_by_state_map %>%
+  mutate(color = mapply(get_color, winning_party_color, color_intensity))
+
+# Create a dummy variable for legend
+votes_by_state_map$legend_party <- ifelse(votes_by_state_map$winning_party == "Republican", "Republican", "Democratic")
+
+# Plotting
+plot_usmap(data = votes_by_state_map, values = "color", color = "white", labels = TRUE) +
+  scale_fill_identity(name = "Winning Party",
+                      breaks = c("red", "blue"),
+                      labels = c("Republican", "Democratic"),
+                      guide = guide_legend(override.aes = list(fill = c("red", "blue")))) +
+  labs(title = "2016 Presidential Election Results by State",
+       fill = "Winning Party") +
+  theme(legend.position = "right",
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 7))
+```
+
+There's seems to be correlation between geographical location and voting pattern. For example, the central states tend to vote Republican, while the coastal states and some northern states tend to vote Democratic.
+
+Divide states into regions and plot the voting results by region.
+
+```{r}
+# Create a mapping of states to regions
+# Define the state, region, and division mappings
+states <- c(
+  "Connecticut", "Maine", "Massachusetts", "New Hampshire", "Rhode Island", "Vermont",
+  "New Jersey", "New York", "Pennsylvania",
+  "Indiana", "Illinois", "Michigan", "Ohio", "Wisconsin",
+  "Iowa", "Kansas", "Minnesota", "Missouri", "Nebraska", "North Dakota", "South Dakota",
+  "Delaware", "District of Columbia", "Florida", "Georgia", "Maryland", "North Carolina", "South Carolina", "Virginia", "West Virginia",
+  "Alabama", "Kentucky", "Mississippi", "Tennessee",
+  "Arkansas", "Louisiana", "Oklahoma", "Texas",
+  "Arizona", "Colorado", "Idaho", "Montana", "Nevada", "New Mexico", "Utah", "Wyoming",
+  "Alaska", "California", "Hawaii", "Oregon", "Washington"
+)
+
+regions <- c(
+  rep("Northeast", 9),
+  rep("Midwest", 12),
+  rep("South", 17),
+  rep("West", 13)
+)
+
+divisions <- c(
+  rep("New England", 6), rep("Middle Atlantic", 3),
+  rep("East North Central", 5), rep("West North Central", 7),
+  rep("South Atlantic", 9), rep("East South Central", 4), rep("West South Central", 4),
+  rep("Mountain", 8), rep("Pacific", 5)
+)
+
+# Create the dataframe
+state_info <- data.frame(
+  state = states,
+  region = regions,
+  division = divisions,
+  stringsAsFactors = FALSE
+)
+
+# Print the dataframe
+print(state_info)
+
+# Add the region column to the votes_by_county dataframe
+votes_by_region <- votes_by_county %>%
+  left_join(state_info, by = c("state" = "state"))
+
+```
+
+```{r}
+average_vote_share_region <- votes_by_region %>%
+  group_by(region) %>%
+  summarise(
+    R_votes = sum(votesR, na.rm = TRUE),
+    D_votes = sum(votesD, na.rm = TRUE),
+    fracR = R_votes / (R_votes + D_votes),
+    fracD = D_votes / (R_votes + D_votes)
+  )
+
+# Print the table
+average_vote_share_region |>
+  select(region, fracR, fracD) |>
+  gt() |>
+  tab_header(title = "Average Vote Share by Region") |>
+  cols_label(
+    region = "Region",
+    fracR = "Republican Vote Share",
+    fracD = "Democratic Vote Share"
+  ) |>
+  fmt_number(
+    columns = vars(fracR, fracD),
+    decimals = 2
+  )
+```
+
+
+```{r}
+average_vote_share_division <- votes_by_region %>%
+  group_by(division) %>%
+  summarise(
+    R_votes = sum(votesR, na.rm = TRUE),
+    D_votes = sum(votesD, na.rm = TRUE),
+    fracR = R_votes / (R_votes + D_votes),
+    fracD = D_votes / (R_votes + D_votes)
+  )
+
+# Print the table
+average_vote_share_division |>
+  select(division, fracR, fracD) |>
+  gt() |>
+  tab_header(title = "Average Vote Share by Division") |>
+  cols_label(
+    division = "Division",
+    fracR = "Republican Vote Share",
+    fracD = "Democratic Vote Share"
+  ) |>
+  fmt_number(
+    columns = vars(fracR, fracD),
+    decimals = 2
+  )
+```
+
+```{r}
+# Assuming votes_by_county already has the 'region' column added as before
+votes_by_state_region <- votes_by_region %>%
+  group_by(state, region) %>%
+  summarise(
+    votesR = sum(votesR, na.rm = TRUE),
+    votesD = sum(votesD, na.rm = TRUE)
+  ) %>%
+  mutate(
+    total_votes = votesR + votesD,
+    point_margin = (votesR - votesD) / total_votes * 100,
+    winning_party = if_else(point_margin > 0, "Republican", "Democratic")
+  ) %>%
+  ungroup()
+
+# Plotting
+ggplot(votes_by_state_region, aes(x = point_margin, y = reorder(state, point_margin), color = winning_party)) +
+  geom_point(size = 3) +
+  facet_wrap(~ region, scales = "free_y", ncol = 1) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "black") +
+  scale_color_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+  labs(
+    title = "2016 US Presidential Election Results by Region",
+    x = "Point Margin",
+    y = "",
+    color = "Winning Party"
+  ) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8),
+        strip.text = element_text(size = 10, face = "bold"),
+        legend.position = "bottom")
+```
+Midwest region tends to vote Republican, while the Northeast regions tend to vote Democratic. 
+
+
+Now let's further divide states into divisions and plot the voting results by division.
+
+```{r}
+# Assuming votes_by_county already has the 'region' column added as before
+votes_by_state_division <- votes_by_region %>%
+  group_by(state, division) %>%
+  summarise(
+    votesR = sum(votesR, na.rm = TRUE),
+    votesD = sum(votesD, na.rm = TRUE)
+  ) %>%
+  mutate(
+    total_votes = votesR + votesD,
+    point_margin = (votesR - votesD) / total_votes * 100,
+    winning_party = if_else(point_margin > 0, "Republican", "Democratic")
+  ) %>%
+  ungroup()
+
+# Plotting
+ggplot(votes_by_state_division, aes(x = point_margin, y = reorder(state, point_margin), color = winning_party)) +
+  geom_point(size = 3) +
+  facet_wrap(~ division, scales = "free_y", ncol = 3) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "black") +
+  scale_color_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+  labs(
+    title = "2016 US Presidential Election Results by Division",
+    x = "Point Margin",
+    y = "",
+    color = "Winning Party"
+  ) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8),
+        strip.text = element_text(size = 10, face = "bold"),
+        legend.position = "bottom")
+```
+
+There does seem to be correlation between geographical location and voting pattern. For example, East North Central, East South Central, and West South Central regions tend to vote Republican, while the Pacific and New England regions tend to vote Democratic. However, there still exists divions where the voting pattern is not as clear-cut, such as South Atlantic and Mountain regions.
+
+This suggests that adding a new variable for region or division could be useful in predicting voting outcomes based on socio-economic indicators.
+
+Further into county level, we will plot the voting results by county.
+
+```{r}
+library(sf)
+library(usmap)
+library(tigris)
+options(tigris_use_cache = TRUE)
+
+# import the county shapefile for year 2016
+county_shp <- counties(year = 2016)
+
+# Extract Connecticut data from county_shp
+ct_data <- county_shp %>%
+  filter(STATEFP %in% c("09")) %>%
+  st_transform(crs = st_crs(4326)) %>%
+  st_simplify(dTolerance = 0.01)
+
+# Add FIPS code and rename columns for Connecticut
+ct_data <- ct_data %>%
+  mutate(
+    fips = paste0(STATEFP, COUNTYFP),
+    abbr = case_when(
+      STATEFP == "09" ~ "CT"
+    ),
+    full = case_when(
+      STATEFP == "09" ~ "Connecticut"
+    ),
+    county = NAMELSAD
+  ) %>%
+  select(fips, abbr, full, county, geom = geometry) %>% # Rearrange columns
+  usmap_transform() # Ensure the transformation is suitable for usmap
+
+us_counties <- us_map(regions = "counties")
+
+# Removing existing Connecticut data from us_counties
+us_counties_removed <- us_counties %>%
+  filter(!abbr %in% c("CT"))
+
+# Add the modified Connecticut data to us_counties
+us_counties_merged <- bind_rows(us_counties_removed, ct_data)
+saveRDS(us_counties_merged, file = "modified_us_counties.rds")
+
+votes_by_county_map <- votes_by_county %>%
+  mutate(fips = as.character(fips),  # Convert to character
+         fips = if_else(str_length(fips) == 4, str_c("0", fips), fips))  # Add leading zero if length is 4
+
+# Return names of counties that are in the votes_by_county_map but not in us_counties_merged
+missing_counties1 <- setdiff(votes_by_county_map$fips, us_counties_merged$fips)
+print(votes_by_county_map |>
+          filter(fips %in% missing_counties1))
+# Return names of counties that are in the us_counties_merged but not in votes_by_county_map
+missing_counties2 <- setdiff(us_counties_merged$fips, votes_by_county_map$fips)
+
+print(us_counties_merged |>
+          filter(fips %in% missing_counties2))
+
+votes_by_county_map <- us_counties_merged %>%
+  left_join(votes_by_county_map, by = 'fips')
+
+# Get state borders
+state_borders <- us_map(regions = "states")
+
+# Get state centroid labels
+state_labels <- usmapdata::centroid_labels("states")
+
+# Plot the voting results
+ggplot(votes_by_county_map) +
+  geom_sf(aes(fill = winning_party, geometry = geom, alpha = frac_diff), color = 'black') +
+  geom_sf(data = state_borders, fill = NA, color = 'white', size = 1) +  # Add state borders
+  geom_sf_text(data = state_labels, aes(label = abbr, geometry = geom), 
+            size = 3, color = "white", fontface = "bold") +  # Add state abbreviations
+  scale_fill_manual(values = c("Republican" = "red", "Democratic" = "blue")) +
+  scale_alpha_continuous(range = c(0.4, 1), guide = "none") +
+  labs(title = "2016 US Presidential Election Results by County",
+       fill = "Winning Party",
+       alpha = "Vote Share Difference") +
+  theme_minimal() +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        panel.grid = element_blank())
+```
+
+After looking up information on the Alaska government website, we found that in 2019, the Valdez-Cordova county was ablished and replaced by the Chugach Census Area and the Copper River Census Area. Also, in 2015, the Wade Hampton Census Area was renamed to the Kusilvak Census Area, and the fips code was changed from 02270 to 02158. We will deal with this later.
+
+Histograms of all numerical variables at the county level
+
+
+```{r}
+# Reshape data to long format for easy plotting
+county_facts_long <- county_facts %>%
+  select(-fips, -state_abbreviation, -county) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value")
+
+# Plot histograms for all numerical variables
+ggplot(county_facts_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "blue", color = "black") +
+  facet_wrap(~ variable, scales = "free_x") +
+  labs(title = "Histograms of All Numerical Variables - County Level",
+       x = "Value",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+```{r}
+ggplot(votes_by_county, aes(x = fracR)) +
+  geom_histogram(bins = 30, fill = "red", color = "black") +
+  labs(title = "Histogram of Republican Vote Share",
+       x = "Republican Vote Share",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+From the histograms, we can see that most of the predictors are right-skewed, indicating that the majority of counties have lower values for these indicators. This is expected as socio-economic indicators such as median household income, educational attainment, and racial demographics tend to vary significantly across counties.
+
+This also suggests that data transformation methods such as logarithm transformation may be necessary to address the skewness in the variables.
+
+Looking at the response variable fracR, we can see that the distribution is not symmetric, with a peak around 0.74. This indicates that the Republican vote share is higher in most counties.
+```{r}
+# Reshape data to long format for easy plotting
+state_facts_long <- state_facts %>%
+  select_if(is.numeric) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value")
+
+# Plot histograms for all numerical variables
+ggplot(state_facts_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "blue", color = "black") +
+  facet_wrap(~ variable, scales = "free_x") +
+  labs(title = "Histograms of All Numerical Variables - State Level",
+       x = "Value",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+```{r}
+ggplot(votes_by_state, aes(x = fracR)) +
+  geom_histogram(bins = 30, fill = "red", color = "black") +
+  labs(title = "Histogram of Republican Vote Share",
+       x = "Republican Vote Share",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+
+Compared to histograms for county level, there is reduced but still significant skewness for most indicators at the state level.
+
+```{r}
+# Preparation for merging demographic socio-economic indicators with county geo data
+
+# add leading 0 to fips with 4 digits
+county_facts_map <- county_facts |>
+  mutate(fips = as.
+         
+         
+         
+         character(fips),
+         fips = if_else(str_length(fips) == 4, str_c("0", fips), fips))
+
+# merge dataset county_facts and us_counties by fips
+county_facts_map <- us_counties_merged |>
+  left_join(county_facts_map, by = c("fips" = "fips")) |>
+  select(-county.y, -state_abbreviation) |>
+  rename(county = county.x)
+
+```
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+library(viridis)
+library(sf)
+library(gridExtra)
+
+# Prepare the list of indicators and their corresponding column names
+indicators <- list(
+  population = "PST045214",
+  white_percentage = "RHI825214",
+  foreign_percentage = "POP645213",
+  bachelors_percentage = "EDU685213",
+  median_household_income = "INC110213"
+)
+
+# Create a function to generate choropleth maps for each indicator with log transformation
+plot_choropleth <- function(data, indicator, title, reduce_ticks = FALSE) {
+  transformed_data <- data %>% 
+    mutate(transformed_value = log1p(!!sym(indicator))) 
+  
+  max_value <- max(transformed_data$transformed_value, na.rm = TRUE)
+  min_value <- min(transformed_data$transformed_value, na.rm = TRUE)
+  
+  # Adjust breaks for population plot to reduce tick labels
+  if (reduce_ticks) {
+    breaks <- pretty(c(min_value, max_value), n = 3)
+  } else {
+    breaks <- seq(ceiling(min_value), floor(max_value), by = 1)
+  }
+  
+  labels <- expm1(breaks)  # Reverse the log1p transformation
+  
+  ggplot(transformed_data) +
+    geom_sf(aes(fill = transformed_value), color = "black") +
+    scale_fill_viridis_c(option = "viridis", na.value = "grey50", breaks = breaks, labels = round(labels, 0)) +
+    geom_sf(data = state_borders, fill = NA, color = 'black', size = 1) +  # Add state borders
+    geom_sf_text(data = state_labels, aes(label = abbr, geometry = geom), size = 3, color = "white", fontface = "bold") +  # Add state abbreviations
+    labs(title = title, fill = title) +
+    theme_minimal() +
+    theme(axis.text = element_blank(),
+          axis.title = element_blank(),
+          panel.grid = element_blank(),
+          legend.position = "bottom")
+}
+
+# Assuming county_facts_map is your spatial dataset
+# Generate plots for each indicator
+plots <- lapply(names(indicators), function(indicator) {
+  if (indicator == "population") {
+    plot_choropleth(county_facts_map, indicators[[indicator]], indicator, reduce_ticks = TRUE)
+  } else {
+    plot_choropleth(county_facts_map, indicators[[indicator]], indicator)
+  }
+})
+
+# Display the plots
+print(plots)
+```
+
+```{r}
+# Merge votes_by_county with county_facts by fips
+merged_data_county <- left_join(votes_by_county, county_facts, by = "fips")
+merged_data_county <- merged_data_county |>
+  filter(complete.cases(county.y)) |>
+  select(-county.y, -state_abbreviation) |>
+  rename(county = county.x)
+
+
+# Change the state name from District Of Columbia to District of Columbia in table state_facts
+state_facts$state <- ifelse(state_facts$state == "District Of Columbia", "District of Columbia", state_facts$state)
+merged_data_state <- merge(votes_by_state, state_facts, by = "state")
+```
+
+We noticed that Kansas City, Missouri is missing in the `county_facts` dataset. We will remove this row from the merged dataset.
+
+Now, let's look at the averaged socio-economic indicators at the county level for each party. We will first start with population:
+
+```{r}
+# Calculate the average population for each party
+average_population <- merged_data_county %>%
+  group_by(winning_party) %>%
+  summarise(average_population_2014 = mean(PST045214, na.rm = TRUE))
+
+# Create the side-by-side bar plot for average population
+plot_population <- ggplot(average_population, aes(x = winning_party, y = average_population_2014, fill = winning_party)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+  labs(title = "County Average Population by Winning Party",
+       x = "Winning Party",
+       y = "Average Population",
+       fill = "Winning Party") +
+  theme_minimal()
+
+# Calculate the average population density for each party
+average_density <- merged_data_county %>%
+  group_by(winning_party) %>%
+  summarise(average_density_2014 = mean(POP060210, na.rm = TRUE))
+
+# Create the side-by-side bar plot for average population density
+plot_density <- ggplot(average_density, aes(x = winning_party, y = average_density_2014, fill = winning_party)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+  labs(title = "County Average Population Density by Winning Party",
+       x = "Winning Party",
+       y = "Average Population Density",
+       fill = "Winning Party") +
+  theme_minimal()
+
+# Calculate the average land area for each party
+average_land_area <- merged_data_county %>%
+  group_by(winning_party) %>%
+  summarise(average_land_area = mean(LND110210, na.rm = TRUE))
+
+# Create the side-by-side bar plot for average land area
+plot_land_area <- ggplot(average_land_area, aes(x = winning_party, y = average_land_area, fill = winning_party)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+  labs(title = "County Average Land Area by Winning Party",
+       x = "Winning Party",
+       y = "Average Land Area",
+       fill = "Winning Party") +
+  theme_minimal()
+
+# Arrange the three plots side by side
+grid.arrange(plot_population, plot_land_area, plot_density, ncol = 3)
+```
+
+Demographic:
+
+```{r}
+# Define the demo_pct_columns
+demo_pct_columns <- c(
+  "AGE135214", "AGE295214", "AGE775214", "SEX255214", "RHI125214",
+  "RHI225214", "RHI325214", "RHI425214", "RHI525214", "RHI625214",
+  "RHI725214", "RHI825214", "POP715213", "POP645213", "POP815213"
+)
+
+# Step 2: Calculate weighted averages for the demo_pct_columns by party
+weighted_averages <- merged_data_county %>%
+  mutate(population = PST045214) %>%
+  group_by(winning_party) %>%
+  summarise(across(all_of(demo_pct_columns), 
+                   ~ sum(.x * population, na.rm = TRUE) / sum(population, na.rm = TRUE), 
+                   .names = "weighted_avg_{col}"))
+
+# Transform to long format for plotting
+long_data <- weighted_averages %>%
+  pivot_longer(cols = starts_with("weighted_avg"), 
+               names_to = "indicator", 
+               values_to = "value") %>%
+  mutate(indicator = str_remove(indicator, "weighted_avg_")) %>%
+  left_join(dictionary, by = c("indicator" = "column_name")) %>%
+  pivot_wider(names_from = winning_party, values_from = value) %>%
+  pivot_longer(cols = c(Democratic, Republican), names_to = "Party", values_to = "Value")
+
+# Create the horizontal side-by-side bar chart
+ggplot(long_data, aes(x = reorder(description, indicator), y = Value, fill = Party)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+  labs(title = "Average Indicator Values by Party",
+       x = "Indicator",
+       y = "Average Value",
+       fill = "Party") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+```
+
+Educational Attainment
+
+```{r}
+library(gridExtra)
+# Calculate the average population for each party
+hs_pct <- merged_data_county %>%
+  group_by(winning_party) %>%
+  summarise(average_hs = mean(EDU635213, na.rm = TRUE))
+
+# Create the side-by-side bar plot for average population
+plot_hs <- ggplot(hs_pct, aes(x = winning_party, y = average_hs, fill = winning_party)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+  labs(title = "High School Graduate Percentage by Winning Party",
+       x = "Winning Party",
+       y = "Average Percentage",
+       fill = "Winning Party") +
+  theme_minimal()
+
+# Calculate the average population density for each party
+college_pct <- merged_data_county %>%
+  group_by(winning_party) %>%
+  summarise(average_college = mean(EDU685213, na.rm = TRUE))
+
+# Create the side-by-side bar plot for average population density
+plot_college <- ggplot(college_pct, aes(x = winning_party, y = average_college, fill = winning_party)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+  labs(title = "Bachelor's degree or higher pct by Winning Party",
+       x = "Winning Party",
+       y = "Average Percentage",
+       fill = "Winning Party") +
+  theme_minimal()
+
+# Arrange the two plots side by side
+grid.arrange(plot_hs, plot_college, ncol = 2)
+```
+
+Housing
+
+```{r}
+
+# Calculate simple averages for non-percentage attributes
+simple_averages <- merged_data_county %>%
+  group_by(winning_party) %>%
+  summarise(across(c("HSG010214", "HSG495213", "HSD410213"), 
+                   ~ mean(.x, na.rm = TRUE), 
+                   .names = "avg_{col}"))
+
+
+# Transform to long format for plotting
+long_data <- simple_averages %>%
+  pivot_longer(cols = starts_with("weighted_avg_") | starts_with("avg_"), 
+               names_to = "indicator", 
+               values_to = "value") %>%
+  mutate(indicator = str_remove(indicator, "weighted_avg_|avg_")) %>%
+  left_join(dictionary, by = c("indicator" = "column_name")) %>%
+  pivot_wider(names_from = winning_party, values_from = value) %>%
+  pivot_longer(cols = c(Democratic, Republican), names_to = "Party", values_to = "Value")
+
+# Create the horizontal side-by-side bar chart
+ggplot(long_data, aes(x = reorder(description, Value), y = Value, fill = Party)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+  labs(title = "Average Housing Indicator Values by Party",
+       x = "Indicator",
+       y = "Average Value",
+       fill = "Party") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+```
+
+housing-2
+
+```{r}
+# Columns to be used
+housing_columns <- c("HSG445213", "HSG096213", "HSG010214", "HSG495213", "HSD410213", "HSD310213", "BPS030214", "LFE305213")
+
+# Calculate weighted averages for percentage columns and simple average for the other column
+weighted_averages <- merged_data_county %>%
+  mutate(population = PST045214) %>%
+  group_by(winning_party) %>%
+  summarise(
+    weighted_avg_HSG445213 = sum(HSG445213 * population, na.rm = TRUE) / sum(population, na.rm = TRUE),
+    weighted_avg_HSG096213 = sum(HSG096213 * population, na.rm = TRUE) / sum(population, na.rm = TRUE),
+    avg_HSD310213 = mean(HSD310213, na.rm = TRUE), 
+    avg_HSG010214 = mean(HSG010214, na.rm = TRUE),
+    avg_HSG495213 = mean(HSG495213, na.rm = TRUE),
+    avg_HSD410213 = mean(HSD410213, na.rm = TRUE),
+    avg_BPS030214 = mean(BPS030214, na.rm = TRUE), 
+    avg_LFE305213 = mean(LFE305213, na.rm = TRUE)
+  )
+
+# Transform to long format for plotting
+long_data <- weighted_averages %>%
+  pivot_longer(cols = starts_with("weighted_avg") | starts_with("avg"), 
+               names_to = "indicator", 
+               values_to = "value") %>%
+  mutate(indicator = case_when(
+    indicator == "weighted_avg_HSG445213" ~ "HSG445213: Homeownership rate",
+    indicator == "weighted_avg_HSG096213" ~ "HSG096213: Housing units in multi-unit structures",
+    indicator == "avg_HSD310213" ~ "HSD310213: Persons per household",
+    indicator == "avg_HSG010214" ~ "HSG010214: Median value of owner-occupied housing units",
+    indicator == "avg_HSG495213" ~ "HSG495213: Median selected monthly owner costs",
+    indicator == "avg_HSD410213" ~ "HSD410213: Median gross rent",
+    indicator == "avg_BPS030214" ~ "BPS030214: Building permits",
+    TRUE ~ indicator
+  ))
+
+# Create the plots
+plot_list <- long_data %>%
+  split(.$indicator) %>%
+  lapply(function(data) {
+    ggplot(data, aes(x = winning_party, y = value, fill = winning_party)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+      labs(title = paste("Average", data$indicator[1], "by Winning Party"),
+           x = "Winning Party",
+           y = data$indicator[1],
+           fill = "Winning Party") +
+      theme_minimal()
+  })
+
+# Display the plots in a single view
+library(gridExtra)
+do.call(grid.arrange, c(plot_list, ncol = 2))
+```
+
+Employment-1
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(gridExtra)
+
+# Columns to be used
+business_columns <- c("BZA010213", "BZA110213", "NES010213", "SBO001207")
+
+# Calculate averages for the business columns
+averages <- merged_data_county %>%
+  group_by(winning_party) %>%
+  summarise(across(all_of(business_columns), mean, na.rm = TRUE, .names = "avg_{col}"))
+
+# Transform to long format for plotting
+long_data <- averages %>%
+  pivot_longer(cols = starts_with("avg"), 
+               names_to = "indicator", 
+               values_to = "value") %>%
+  mutate(indicator = case_when(
+    indicator == "avg_BZA010213" ~ "BZA010213: Number of nonemployer establishments",
+    indicator == "avg_BZA110213" ~ "BZA110213: Number of employer establishments",
+    indicator == "avg_BZA115213" ~ "BZA115213: Employer establishments, percent change",
+    indicator == "avg_NES010213" ~ "NES010213: Number of employees",
+    indicator == "avg_SBO001207" ~ "SBO001207: Number of firms",
+    TRUE ~ indicator
+  ))
+
+# Create the plots
+plot_list <- long_data %>%
+  split(.$indicator) %>%
+  lapply(function(data) {
+    ggplot(data, aes(x = winning_party, y = value, fill = winning_party)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+      labs(title = data$indicator[1],
+           x = "Winning Party",
+           y = "Average Value",
+           fill = "Winning Party") +
+      theme_minimal()
+  })
+
+# Display the plots in a single view
+do.call(grid.arrange, c(plot_list, ncol = 2))
+```
+
+Employment-2
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(gridExtra)
+
+# Columns to be used
+business_columns <- c("BZA115213", "SBO315207", "SBO115207", "SBO215207", "SBO515207", "SBO415207", "SBO015207")
+
+# Calculate weighted averages for the business columns
+weighted_averages <- merged_data_county %>%
+  mutate(population = PST045214) %>%
+  group_by(winning_party) %>%
+  summarise(across(all_of(business_columns), 
+                   ~ sum(.x * population, na.rm = TRUE) / sum(population, na.rm = TRUE), 
+                   .names = "weighted_avg_{col}"))
+
+# Transform to long format for plotting
+long_data <- weighted_averages %>%
+  pivot_longer(cols = starts_with("weighted_avg"), 
+               names_to = "indicator", 
+               values_to = "value") %>%
+  mutate(indicator = str_remove(indicator, "weighted_avg_")) %>%
+  mutate(description = case_when(
+    indicator == "BZA115213" ~ "Employer establishments, percent change",
+    indicator == "SBO315207" ~ "Black-owned firms, percent",
+    indicator == "SBO115207" ~ "American Indian- and Alaska Native-owned firms, percent",
+    indicator == "SBO215207" ~ "Asian-owned firms, percent",
+    indicator == "SBO515207" ~ "Native Hawaiian- and Other Pacific Islander-owned firms, percent",
+    indicator == "SBO415207" ~ "Hispanic-owned firms, percent",
+    indicator == "SBO015207" ~ "Women-owned firms, percent",
+    TRUE ~ indicator
+  ))
+
+# Create the plots
+plot_list <- long_data %>%
+  split(.$indicator) %>%
+  lapply(function(data) {
+    ggplot(data, aes(x = winning_party, y = value, fill = winning_party)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+      labs(title = data$description[1],
+           x = "Winning Party",
+           y = "Weighted Average Value",
+           fill = "Winning Party") +
+      theme_minimal()
+  })
+
+# Display the plots in a single view
+do.call(grid.arrange, c(plot_list, ncol = 2))
+
+```
+
+Sales:
+
+```{r}
+
+# Columns to be used
+sales_columns <- c("MAN450207", "WTN220207", "RTN130207", "RTN131207", "AFN120207")
+
+# Calculate simple averages for the specified columns
+simple_averages <- merged_data_county %>%
+  group_by(winning_party) %>%
+  summarise(across(all_of(sales_columns), 
+                   ~ mean(.x, na.rm = TRUE), 
+                   .names = "avg_{col}"))
+
+# Transform to long format for plotting
+long_data <- simple_averages %>%
+  pivot_longer(cols = starts_with("avg"), 
+               names_to = "indicator", 
+               values_to = "value") %>%
+  mutate(indicator = str_remove(indicator, "avg_")) %>%
+  mutate(description = case_when(
+    indicator == "MAN450207" ~ "Manufacturers shipments, 2007 ($1,000)",
+    indicator == "WTN220207" ~ "Wholesale trade sales, 2007 ($1,000)",
+    indicator == "RTN130207" ~ "Retail sales, 2007 ($1,000)",
+    indicator == "RTN131207" ~ "Retail sales per capita, 2007",
+    indicator == "AFN120207" ~ "Accommodation and food services sales, 2007 ($1,000)",
+    TRUE ~ indicator
+  ))
+
+# Create the plots
+plot_list <- long_data %>%
+  split(.$indicator) %>%
+  lapply(function(data) {
+    ggplot(data, aes(x = winning_party, y = value, fill = winning_party)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+      labs(title = data$description[1],
+           x = "Winning Party",
+           y = "Average Value",
+           fill = "Winning Party") +
+      theme_minimal()
+  })
+
+# Display the plots in a single view
+do.call(grid.arrange, c(plot_list, ncol = 2))
+```

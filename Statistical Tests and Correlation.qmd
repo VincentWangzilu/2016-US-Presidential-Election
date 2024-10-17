@@ -1,0 +1,933 @@
+# Data Pre-processing
+
+```{r}
+## Read datasets
+PresElect2016R <- read_csv("PresElect2016R copy.csv")
+UScounty_facts <- read_csv("UScounty-facts.csv", locale = locale(encoding = "ISO-8859-1"))
+dictionary <- read_csv("UScounty-dictionary.csv")
+
+# Rename columns in PresElect2016R
+votes_by_county <- PresElect2016R |>
+  rename(
+    state = state,
+    state.po = state.po,
+    county = county,
+    fips = FIPS,
+    votesR = candidatevotesR,
+    votesD = candidatevotesD, 
+    fracR = fracvotesR
+  )
+
+#Add columns fracD, totalvotes, winning_party to the votes_by_county dataframe.
+votes_by_county <- votes_by_county |>
+  mutate(
+    fracD = votesD / totalvotes,
+    frac_diff = abs(fracR - fracD),
+    totalvotes = votesR + votesD,
+    winning_party = ifelse(fracR > fracD, "Republican", "Democratic")
+  )
+
+votes_by_state <- votes_by_county %>%
+  group_by(state, state.po) %>%
+  summarise(
+    totalvotes = sum(totalvotes, na.rm = TRUE),
+    votesR = sum(votesR, na.rm = TRUE),
+    votesD = sum(votesD, na.rm = TRUE),
+    fracR = votesR / totalvotes,
+    fracD = votesD / totalvotes,
+    frac_diff = abs(fracR - fracD), 
+    partywonR = ifelse(votesR > votesD, 1, 0),
+    winning_party = if_else(fracR > fracD, "Republican", "Democratic")
+  )
+
+state_facts <- UScounty_facts |>
+  filter(is.na(state_abbreviation)) |>
+  rename(state = area_name) |>
+  dplyr::select(-state_abbreviation, -fips)
+
+county_facts <- UScounty_facts |>
+  filter(!is.na(state_abbreviation)) |>
+  rename(county = area_name) 
+
+state_facts$state <- ifelse(state_facts$state == "District Of Columbia", "District of Columbia", state_facts$state)
+merged_data_state <- merge(votes_by_state, state_facts, by = "state")
+merged_data_state <- merge(merged_data_state, state_info, by = "state") |>
+  dplyr::select(-region, -division)
+
+merged_data_state$winning_party <- as.factor(merged_data_state$winning_party)
+
+# Merge votes_by_county with county_facts by fips
+merged_data_county <- left_join(votes_by_county, county_facts, by = "fips") 
+merged_data_county <- merged_data_county |>
+  filter(complete.cases(county.y)) |>
+  dplyr::select(-county.y, -state_abbreviation) |>
+  rename(county = county.x)
+merged_data_county$winning_party <- as.factor(merged_data_county$winning_party)
+
+```
+
+# Statistical Tests
+
+## State Level
+
+```{r}
+library(tidyverse)
+library(stats)
+library(coin)
+library(rstatix)
+
+# prepare data
+data <- merged_data_state[, c("winning_party", dictionary$column_name)]
+data$winning_party <- as.factor(data$winning_party)
+
+# Function to perform Shapiro-Wilk test
+shapiro_test <- function(x) {
+  test <- shapiro.test(x)
+  return(test$p.value)
+}
+
+# Function to calculate IQR ratio
+calculate_iqr_ratio <- function(data, variable, group) {
+  group1 <- data[data[[group]] == unique(data[[group]])[1], ][[variable]]
+  group2 <- data[data[[group]] == unique(data[[group]])[2], ][[variable]]
+  
+  iqr1 <- IQR(group1, na.rm = TRUE)
+  iqr2 <- IQR(group2, na.rm = TRUE)
+  
+  if (iqr1 == 0 && iqr2 == 0) return(1)
+  if (iqr1 == 0 || iqr2 == 0) return(Inf)
+  
+  return(max(iqr1, iqr2) / min(iqr1, iqr2))
+}
+
+# Function to interpret effect size
+interpret_effect_size <- function(effect_size, test_type) {
+  if (test_type == "Welch's t-test") {
+    if (abs(effect_size) < 0.2) return("Negligible")
+    if (abs(effect_size) < 0.5) return("Small")
+    if (abs(effect_size) < 0.8) return("Medium")
+    return("Large")
+  } else if (test_type == "Mann-Whitney U test") {
+    if (abs(effect_size) < 0.147) return("Negligible")
+    if (abs(effect_size) < 0.33) return("Small")
+    if (abs(effect_size) < 0.474) return("Medium")
+    return("Large")
+  } else if (test_type == "Permutation test") {
+    if (abs(effect_size) < 0.147) return("Negligible")
+    if (abs(effect_size) < 0.33) return("Small")
+    if (abs(effect_size) < 0.474) return("Medium")
+    return("Large")
+  }
+}
+
+# Select numeric variables
+numeric_vars <- data %>%
+  dplyr::select(where(is.numeric)) %>%
+  names()
+
+# Perform Shapiro-Wilk test for all variables
+normality_results <- sapply(numeric_vars, function(var) shapiro_test(data[[var]]))
+
+# Adjust p-values for Shapiro-Wilk test
+adjusted_normality_p <- p.adjust(normality_results, method = "BH")
+
+# Initialize results dataframe
+results <- data.frame(
+  variable = numeric_vars,
+  normality = adjusted_normality_p > 0.05,
+  similar_spread = NA,
+  test_used = NA,
+  statistic = NA,
+  p_value = NA,
+  effect_size = NA,
+  effect_size_interpretation = NA
+)
+
+# Perform tests for each variable
+for (i in 1:length(numeric_vars)) {
+  var <- numeric_vars[i]
+  
+  if (results$normality[i]) {
+    # Welch's t-test for normal distributions
+    test_result <- t.test(data[[var]] ~ data$winning_party)
+    results$test_used[i] <- "Welch's t-test"
+    results$statistic[i] <- test_result$statistic
+    results$p_value[i] <- test_result$p.value
+    
+    # Calculate Cohen's d
+    group1 <- data[data$winning_party == levels(data$winning_party)[1], ][[var]]
+    group2 <- data[data$winning_party == levels(data$winning_party)[2], ][[var]]
+    pooled_sd <- sqrt(((length(group1) - 1) * sd(group1)^2 + (length(group2) - 1) * sd(group2)^2) / 
+                        (length(group1) + length(group2) - 2))
+    results$effect_size[i] <- (mean(group1) - mean(group2)) / pooled_sd
+  } else {
+    # Check for similar spreads
+    iqr_ratio <- calculate_iqr_ratio(data, var, "winning_party")
+    results$similar_spread[i] <- iqr_ratio <= 2
+    
+    if (results$similar_spread[i]) {
+      # Mann-Whitney U test for similar but non-normal distributions
+      test_result <- wilcox_test(as.formula(paste(var, "~ winning_party")), data = data)
+      results$test_used[i] <- "Mann-Whitney U test"
+      results$statistic[i] <- test_result$statistic
+      results$p_value[i] <- test_result$p
+      
+      # Calculate Cliff's delta
+      group1 <- data[data$winning_party == levels(data$winning_party)[1], ][[var]]
+      group2 <- data[data$winning_party == levels(data$winning_party)[2], ][[var]]
+      results$effect_size[i] <- cliff.delta(group1, group2)$estimate
+    } else {
+      # Permutation test for non-normal and dissimilar distributions
+      test_result <- independence_test(as.formula(paste(var, "~ winning_party")), data = data)
+      results$test_used[i] <- "Permutation test"
+      results$statistic[i] <- test_result@statistic@teststatistic
+      results$p_value[i] <- pvalue(test_result)
+      
+      # Calculate Calculate Cliff's delta
+      group1 <- data[data$winning_party == levels(data$winning_party)[1], ][[var]]
+      group2 <- data[data$winning_party == levels(data$winning_party)[2], ][[var]]
+      results$effect_size[i] <- cliff.delta(group1, group2)$estimate
+    }
+  }
+  
+  # Interpret effect size
+  results$effect_size_interpretation[i] <- interpret_effect_size(results$effect_size[i], results$test_used[i])
+}
+
+# Adjust p-values for multiple testing (for the main tests)
+results$adjusted_p_value <- p.adjust(results$p_value, method = "BH")
+
+# Sort results by adjusted p-value
+results <- results %>% arrange(adjusted_p_value)
+# reset row names
+rownames(results) <- NULL
+# Print results
+print(results)
+
+# Summarize findings
+cat("\nVariables with significant differences (adjusted p < 0.05):\n")
+significant_results <- results %>% 
+        filter(adjusted_p_value < 0.05) %>% 
+        dplyr::select(variable, test_used, adjusted_p_value, effect_size, effect_size_interpretation)
+print(significant_results)
+```
+```{r}
+library(knitr)
+library(kableExtra)
+
+# Example data
+significant_results <- data.frame(
+  variable = c("HSG495213", "INC910213", "EDU685213", "INC110213", "POP645213", "HSG096213",
+               "LFE305213", "POP815213", "SBO015207", "AGE295214", "RHI425214", "PVY020213",
+               "SBO415207", "RHI625214", "AGE135214", "HSG445213", "SBO215207", "RHI725214"),
+  test_used = c("Mann-Whitney U test", "Mann-Whitney U test", "Mann-Whitney U test", "Mann-Whitney U test", 
+                "Mann-Whitney U test", "Permutation test", "Welch's t-test", "Permutation test", 
+                "Welch's t-test", "Mann-Whitney U test", "Permutation test", "Welch's t-test", 
+                "Mann-Whitney U test", "Mann-Whitney U test", "Mann-Whitney U test", "Permutation test", 
+                "Permutation test", "Mann-Whitney U test"),
+  adjusted_p_value = c(0.0000020850, 0.0000033750, 0.0000067875, 0.0000067875, 0.0002760000, 0.0003144559, 
+                       0.0003908259, 0.0020776657, 0.0020776657, 0.0026450000, 0.0105432006, 0.0105432006, 
+                       0.0182307692, 0.0211428571, 0.0274787447, 0.0274787447, 0.0274787447, 0.0319444444),
+  effect_size = c(0.9111111, 0.8031746, 0.8349206, 0.7714286, 0.6968254, 0.7206349, 1.2904336, 0.6380952, 
+                  1.1671625, -0.5761905, 0.7095238, -0.9168943, 0.4698413, 0.4571429, -0.4349206, -0.3158730, 
+                  0.6317460, 0.4206349),
+  effect_size_interpretation = c("Large", "Large", "Large", "Large", "Large", "Medium", "Large", "Medium", 
+                                 "Large", "Large", "Medium", "Large", "Medium", "Medium", "Medium", "Small", 
+                                 "Medium", "Medium")
+)
+
+# Mapping for variable descriptions
+variable_descriptions <- c(
+  HSG495213 = "Median house values",
+  INC910213 = "Per capita income",
+  EDU685213 = "Bachelor's degree or higher",
+  INC110213 = "Median household income",
+  POP645213 = "Foreign-born persons",
+  HSG096213 = "Percent of housing units",
+  LFE305213 = "Mean travel time to work",
+  POP815213 = "Non-English speakers at home",
+  SBO015207 = "Women-owned businesses",
+  AGE295214 = "Persons under 18 years",
+  RHI425214 = "Asian population",
+  PVY020213 = "Poverty rate",
+  SBO415207 = "Hispanic-owned businesses",
+  RHI625214 = "Two or more races",
+  AGE135214 = "Persons under 5 years",
+  HSG445213 = "Homeownership rate",
+  SBO215207 = "Asian-owned businesses",
+  RHI725214 = "Hispanic population"
+)
+
+# Replace variable names with descriptions
+significant_results$variable <- sapply(significant_results$variable, function(x) variable_descriptions[x])
+
+# Convert adjusted p-values to scientific notation
+significant_results$adjusted_p_value <- format(significant_results$adjusted_p_value, scientific = TRUE)
+
+# Replace effect size interpretation symbols
+significant_results$effect_size_interpretation <- gsub("Large", "***", significant_results$effect_size_interpretation)
+significant_results$effect_size_interpretation <- gsub("Medium", "**", significant_results$effect_size_interpretation)
+significant_results$effect_size_interpretation <- gsub("Small", "*", significant_results$effect_size_interpretation)
+significant_results$effect_size_measure <- ifelse(significant_results$test_used == "Welch's t-test", "Cohen's d", "Cliff's delta")
+
+# Reduce decimal points to two places after the point for effect_size
+significant_results$effect_size <- round(significant_results$effect_size, 2)
+
+# Convert adjusted p-values to scientific notation and reduce to two decimal places
+significant_results$adjusted_p_value <- format(significant_results$adjusted_p_value, scientific = FALSE, digits = 2)
+
+# Rearrange columns to switch effect_size_measure and effect_size_interpretation
+significant_results <- significant_results[, c("variable", "test_used", "adjusted_p_value", "effect_size", "effect_size_measure", "effect_size_interpretation")]
+
+# Create the table using kableExtra
+significant_results %>%
+  kbl(caption = "Significant Results from Statistical Tests", col.names = c("Variable", "Test Used", "Adjusted p-value", "Effect Size", "Effect Size Measure", "Effect Size Interpretation")) %>%
+  kable_paper("striped", full_width = F) %>%
+  column_spec(1, bold = TRUE) %>%
+  kable_styling(latex_options = "hold_position")
+
+```
+
+-   Median value of owner-occupied housing units
+
+-   Per capita money income in past 12 months
+
+-   Bachelor's degree or higher percentage
+
+-   Median household income
+
+-   Foreign born persons percent
+
+-   Housing units in multi-unit structures percent
+
+-   Mean travel time to work (minutes)
+
+-   Language other than English spoken at home percent
+
+-   Women-owned firms, percent
+
+-   Persons under 18 years, percent
+
+-   Asian alone, percent
+
+-   Persons below poverty level, percent
+
+-   Hispanic-owned firms, percent
+
+-   Two or More Races, percent
+
+-   Persons under 5 years, percent
+
+-   Homeownership rate
+
+-   Asian-owned firms, percent
+
+-   Hispanic or Latino, percent
+
+## County Level
+
+```{r}
+library(tidyverse)
+library(stats)
+library(coin)
+library(rstatix)
+
+# prepare data
+data <- merged_data_county[, c("winning_party", dictionary$column_name)]
+data$winning_party <- as.factor(data$winning_party)
+
+# Select numeric variables
+numeric_vars <- data %>%
+  dplyr::select(where(is.numeric)) %>%
+  names()
+
+# Perform Shapiro-Wilk test for all variables
+normality_results <- sapply(numeric_vars, function(var) shapiro_test(data[[var]]))
+
+# Adjust p-values for Shapiro-Wilk test
+adjusted_normality_p <- p.adjust(normality_results, method = "BH")
+
+# Initialize results dataframe
+results <- data.frame(
+  variable = numeric_vars,
+  normality = adjusted_normality_p > 0.05,
+  similar_spread = NA,
+  test_used = NA,
+  statistic = NA,
+  p_value = NA,
+  effect_size = NA,
+  effect_size_interpretation = NA
+)
+
+# Perform tests for each variable
+for (i in 1:length(numeric_vars)) {
+  var <- numeric_vars[i]
+  
+  if (results$normality[i]) {
+    # Welch's t-test for normal distributions
+    test_result <- t.test(data[[var]] ~ data$winning_party)
+    results$test_used[i] <- "Welch's t-test"
+    results$statistic[i] <- test_result$statistic
+    results$p_value[i] <- test_result$p.value
+    
+    # Calculate Cohen's d
+    group1 <- data[data$winning_party == levels(data$winning_party)[1], ][[var]]
+    group2 <- data[data$winning_party == levels(data$winning_party)[2], ][[var]]
+    pooled_sd <- sqrt(((length(group1) - 1) * sd(group1)^2 + (length(group2) - 1) * sd(group2)^2) / 
+                        (length(group1) + length(group2) - 2))
+    results$effect_size[i] <- (mean(group1) - mean(group2)) / pooled_sd
+  } else {
+    # Check for similar spreads
+    iqr_ratio <- calculate_iqr_ratio(data, var, "winning_party")
+    results$similar_spread[i] <- iqr_ratio <= 2
+    
+    if (results$similar_spread[i]) {
+      # Mann-Whitney U test for similar but non-normal distributions
+      test_result <- wilcox_test(as.formula(paste(var, "~ winning_party")), data = data)
+    results$test_used[i] <- "Mann-Whitney U test"
+    results$statistic[i] <- test_result$statistic
+    results$p_value[i] <- test_result$p
+      
+      # Calculate Cliff's delta
+      group1 <- data[data$winning_party == levels(data$winning_party)[1], ][[var]]
+      group2 <- data[data$winning_party == levels(data$winning_party)[2], ][[var]]
+      results$effect_size[i] <- cliff.delta(group1, group2)$estimate
+    } else {
+      # Permutation test for non-normal and dissimilar distributions
+      test_result <- independence_test(as.formula(paste(var, "~ winning_party")), data = data)
+      results$test_used[i] <- "Permutation test"
+      results$statistic[i] <- test_result@statistic@teststatistic
+      results$p_value[i] <- pvalue(test_result)
+      
+      # Calculate Cliff's delta
+      group1 <- data[data$winning_party == levels(data$winning_party)[1], ][[var]]
+      group2 <- data[data$winning_party == levels(data$winning_party)[2], ][[var]]
+      results$effect_size[i] <- cliff.delta(group1, group2)$estimate
+    }
+  }
+  
+  # Interpret effect size
+  results$effect_size_interpretation[i] <- interpret_effect_size(results$effect_size[i], results$test_used[i])
+}
+
+# Adjust p-values for multiple testing (for the main tests)
+results$adjusted_p_value <- p.adjust(results$p_value, method = "BH")
+
+# Sort results by adjusted p-value
+results <- results %>% arrange(adjusted_p_value)
+# reset row names
+rownames(results) <- NULL
+# Print results
+print(results)
+
+# Summarize findings
+cat("\nVariables with significant differences (adjusted p < 0.05):\n")
+print(results %>% 
+        filter(adjusted_p_value < 0.05) %>% 
+        dplyr::select(variable, test_used, adjusted_p_value, effect_size, effect_size_interpretation) %>%
+        arrange(desc(abs(effect_size))))
+
+#save this table
+write.csv(results, "county_level_statistical_tests.csv")
+```
+
+# Correlation Analysis
+
+## State level - Kendall's Tau
+
+### Kendall's Tau
+
+**Pros:**
+
+1.  **Robust to Ties:** Kendall's Tau is more robust to ties in the data compared to Spearman's rank correlation.
+
+2.  **Non-parametric:** It does not assume a specific distribution for the data, making it suitable for ordinal data and non-normal distributions.
+
+3.  **Interpretability:** The interpretation of Kendall's Tau is straightforward: it represents the difference between the probability of observing concordant pairs versus discordant pairs.
+
+4.  **Sensitivity to Small Samples:** Kendall's Tau tends to perform well with small sample sizes and can provide more reliable estimates in such cases.
+
+**Cons:**
+
+1.  **Computation Intensive:** It can be computationally more intensive than Pearson's and Spearman's, especially with large datasets, due to the need to count concordant and discordant pairs.
+
+2.  **Lower Power:** Kendall's Tau generally has lower statistical power compared to Pearson's and Spearman's correlations, meaning it may be less likely to detect a true association if one exists.
+
+```{r}
+library(tidyverse)
+library(corrplot)
+
+data <- merged_data_state[, c("fracR", dictionary$column_name)]
+numeric_data <- data %>% dplyr::select(where(is.numeric))
+
+# Calculate Kendall's Tau correlation matrix
+cor_matrix <- cor(numeric_data, method = "kendall")
+
+# Initialize p-value matrix
+p_matrix <- matrix(NA, nrow = ncol(numeric_data), ncol = ncol(numeric_data))
+colnames(p_matrix) <- rownames(p_matrix) <- colnames(cor_matrix)
+
+# Calculate p-values
+for(i in 1:(ncol(numeric_data)-1)) {
+  for(j in (i+1):ncol(numeric_data)) {
+    test_result <- cor.test(numeric_data[[i]], numeric_data[[j]], method = "kendall")
+    p_matrix[i,j] <- p_matrix[j,i] <- test_result$p.value
+  }
+}
+
+# Extract p-values
+p_values <- p_matrix[upper.tri(p_matrix)]
+
+# Adjust p-values
+p_adjusted <- p.adjust(p_values, method = "BH")
+
+# Create full adjusted p-value matrix
+p_matrix_adj <- matrix(NA, nrow = nrow(p_matrix), ncol = ncol(p_matrix))
+p_matrix_adj[upper.tri(p_matrix_adj)] <- p_adjusted
+p_matrix_adj[lower.tri(p_matrix_adj)] <- t(p_matrix_adj)[lower.tri(p_matrix_adj)]
+diag(p_matrix_adj) <- 1
+colnames(p_matrix_adj) <- rownames(p_matrix_adj) <- colnames(cor_matrix)
+
+# Extract correlations with fracR
+fracR_correlations <- data.frame(
+  Variable = colnames(cor_matrix),
+  Correlation = cor_matrix[, "fracR"],
+  P_value = p_matrix[, "fracR"],
+  P_value_adjusted = p_matrix_adj[, "fracR"]
+)
+
+# Remove fracR's correlation with itself
+fracR_correlations <- fracR_correlations[fracR_correlations$Variable != "fracR", ]
+
+# Sort by absolute correlation in descending order
+fracR_correlations <- fracR_correlations[order(-abs(fracR_correlations$Correlation)), ]
+
+# Add significance stars
+fracR_correlations$Significance <- ""
+fracR_correlations$Significance[fracR_correlations$P_value_adjusted < 0.05] <- "*"
+fracR_correlations$Significance[fracR_correlations$P_value_adjusted < 0.01] <- "**"
+fracR_correlations$Significance[fracR_correlations$P_value_adjusted < 0.001] <- "***"
+
+# Print the results
+print(fracR_correlations, digits = 3)
+
+# Visualize top 10 correlations
+top_10 <- head(fracR_correlations, 10)
+ggplot(top_10, aes(x = reorder(Variable, Correlation), y = Correlation)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.2f%s", Correlation, Significance)), hjust = ifelse(top_10$Correlation > 0, -0.1, 1.1)) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 10 Correlations with fracR",
+       x = "Variables",
+       y = "Kendall's Tau Correlation")
+
+
+cat("\nNumber of significant correlations with fracR (adjusted p < 0.05):", sum(fracR_correlations$P_value_adjusted < 0.05))
+
+# Convert the correlation matrix to a data frame
+cor_df <- as.data.frame(cor_matrix)
+
+# Add variable names as a column
+cor_df$variable <- rownames(cor_df)
+
+# Filter for correlations with PST045214
+pst045214_correlations <- cor_df %>%
+  dplyr::select(variable, PST045214) %>%
+  rename(correlation = PST045214) %>%
+  mutate(abs_correlation = abs(correlation)) %>%
+  filter(variable != "PST045214") %>%  # Remove self-correlation
+  arrange(desc(abs_correlation))
+
+# Add adjusted p-values
+pst045214_correlations$adj_p_value <- p_matrix_adj[pst045214_correlations$variable, "PST045214"]
+
+# Filter for high correlations (|τ| >= 0.5) and significant p-values
+high_correlations <- pst045214_correlations %>%
+  filter(abs_correlation >= 0.5, adj_p_value < 0.05)
+
+# Print the results
+print(high_correlations)
+
+```
+
+```{r}
+library(ggplot2)
+library(reshape2)
+library(GGally)
+cor_matrix <- cor(data, method = "kendall", use = "complete.obs")
+cor_melt <- melt(cor_matrix)
+ggplot(cor_melt, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1, 1), space = "Lab", 
+                       name="Kendall's Tau") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                   size = 12, hjust = 1)) +
+  coord_fixed() +
+  labs(title = "State-Level Correlation Matrix Heatmap (Kendall's Tau)",
+       x = "Variables", y = "Variables")
+```
+```{r}
+cor_matrix <- cor(data, method = "kendall", use = "complete.obs")
+
+# Melt the correlation matrix into a long format
+cor_melt <- melt(cor_matrix)
+
+# Filter the melted data to keep only the correlations greater than 0.5 or less than -0.5
+high_correlations <- cor_melt[(cor_melt$value > 0.5 | cor_melt$value < -0.5) & cor_melt$Var1 != cor_melt$Var2, ]
+
+# Remove duplicate pairs (e.g., if (Var1, Var2) is present, remove (Var2, Var1))
+high_correlations <- high_correlations[!duplicated(t(apply(high_correlations, 1, sort))), ]
+
+# Display the filtered correlations
+print(high_correlations)
+```
+
+
+-   **Housing Value (HSG495213)**: Strong negative correlation (-0.6167, p \< 0.001)
+
+    -   States with higher median values of owner-occupied housing units tend to have lower Republican vote fractions.
+
+-   **Asian Population (RHI425214)**: Strong negative correlation (-0.5854, p \< 0.001)
+
+    -   States with a higher percentage of Asian population tend to have lower Republican vote fractions.
+
+-   **Foreign-born Population (POP645213)**: Strong negative correlation (-0.5663, p \< 0.001)
+
+    -   States with a higher percentage of foreign-born persons tend to have lower Republican vote fractions.
+
+-   **Multi-unit Housing (HSG096213)**: Strong negative correlation (-0.5480, p \< 0.001)
+
+    -   States with a higher percentage of housing units in multi-unit structures tend to have lower Republican vote fractions.
+
+-   **Education Level (EDU685213)**: Strong negative correlation (-0.5360, p \< 0.001)
+
+    -   States with a higher percentage of persons with a bachelor's degree or higher tend to have lower Republican vote fractions.
+
+-   **Asian-owned Businesses (SBO215207)**: Strong negative correlation (-0.5322, p \< 0.001)
+
+    -   States with a higher percentage of Asian-owned firms tend to have lower Republican vote fractions.
+
+-   **Women-owned Businesses (SBO015207)**: Moderate negative correlation (-0.5101, p \< 0.001)
+
+    -   States with a higher percentage of women-owned firms tend to have lower Republican vote fractions.
+
+-   **Income (INC910213, INC110213)**: Moderate negative correlations (-0.5059 and -0.4776, p \< 0.001)
+
+    -   States with higher per capita and median household incomes tend to have lower Republican vote fractions.
+
+-   **Population Density (POP060210)**: Moderate negative correlation (-0.4315, p \< 0.001)
+
+    -   More densely populated states tend to have lower Republican vote fractions.
+
+-   **Youth Population (AGE295214)**: Moderate positive correlation (0.3670, p \< 0.001)
+
+    -   States with a higher percentage of persons under 18 years tend to have higher Republican vote fractions.
+
+-   **White Non-Hispanic Population (RHI825214)**: Moderate positive correlation (0.3327, p \< 0.01)
+
+    -   States with a higher percentage of white, non-Hispanic population tend to have higher Republican vote fractions.
+
+**Key Observations:**
+
+-   Urban characteristics (higher housing values, multi-unit housing, population density) are associated with lower Republican vote fractions.
+
+-   Higher education and income levels are associated with lower Republican vote fractions.
+
+-   Diversity indicators (Asian population, foreign-born population) are associated with lower Republican vote fractions.
+
+-   States with more youth and more white non-Hispanic population tend to have higher Republican vote fractions.
+
+## County Level
+
+```{r}
+library(tidyverse)
+library(corrplot)
+
+data <- merged_data_county[, c("fracR", dictionary$column_name)]
+numeric_data <- data %>% dplyr::select(where(is.numeric))
+
+# Calculate Kendall's Tau correlation matrix
+cor_matrix <- cor(numeric_data, method = "kendall")
+
+# Initialize p-value matrix
+p_matrix <- matrix(NA, nrow = ncol(numeric_data), ncol = ncol(numeric_data))
+colnames(p_matrix) <- rownames(p_matrix) <- colnames(cor_matrix)
+
+# Calculate p-values
+for(i in 1:(ncol(numeric_data)-1)) {
+  for(j in (i+1):ncol(numeric_data)) {
+    test_result <- cor.test(numeric_data[[i]], numeric_data[[j]], method = "kendall")
+    p_matrix[i,j] <- p_matrix[j,i] <- test_result$p.value
+  }
+}
+
+# Extract p-values
+p_values <- p_matrix[upper.tri(p_matrix)]
+
+# Adjust p-values
+p_adjusted <- p.adjust(p_values, method = "BH")
+
+# Create full adjusted p-value matrix
+p_matrix_adj <- matrix(NA, nrow = nrow(p_matrix), ncol = ncol(p_matrix))
+p_matrix_adj[upper.tri(p_matrix_adj)] <- p_adjusted
+p_matrix_adj[lower.tri(p_matrix_adj)] <- t(p_matrix_adj)[lower.tri(p_matrix_adj)]
+diag(p_matrix_adj) <- 1
+colnames(p_matrix_adj) <- rownames(p_matrix_adj) <- colnames(cor_matrix)
+
+# Extract correlations with fracR
+fracR_correlations <- data.frame(
+  Variable = colnames(cor_matrix),
+  Correlation = cor_matrix[, "fracR"],
+  P_value = p_matrix[, "fracR"],
+  P_value_adjusted = p_matrix_adj[, "fracR"]
+)
+
+# Remove fracR's correlation with itself
+fracR_correlations <- fracR_correlations[fracR_correlations$Variable != "fracR", ]
+
+# Sort by absolute correlation in descending order
+fracR_correlations <- fracR_correlations[order(-abs(fracR_correlations$Correlation)), ]
+
+# Add significance stars
+fracR_correlations$Significance <- ""
+fracR_correlations$Significance[fracR_correlations$P_value_adjusted < 0.05] <- "*"
+fracR_correlations$Significance[fracR_correlations$P_value_adjusted < 0.01] <- "**"
+fracR_correlations$Significance[fracR_correlations$P_value_adjusted < 0.001] <- "***"
+
+# Print the results
+print(fracR_correlations, digits = 3)
+
+# Visualize top 10 correlations
+top_10 <- head(fracR_correlations, 10)
+ggplot(top_10, aes(x = reorder(Variable, Correlation), y = Correlation)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.2f%s", Correlation, Significance)), hjust = ifelse(top_10$Correlation > 0, -0.1, 1.1)) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 10 Correlations with fracR",
+       x = "Variables",
+       y = "Kendall's Tau Correlation")
+
+
+cat("\nNumber of significant correlations with fracR (adjusted p < 0.05):", sum(fracR_correlations$P_value_adjusted < 0.05))
+```
+
+**Housing Units in Multi-Unit Structures (HSG096213)**: Strongest negative correlation (-0.4001, p \< 0.001)
+```{r}
+library(ggplot2)
+library(reshape2)
+library(GGally)
+cor_matrix <- cor(data, method = "kendall", use = "complete.obs")
+cor_melt <- melt(cor_matrix)
+ggplot(cor_melt, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1, 1), space = "Lab", 
+                       name="Kendall's Tau") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                   size = 12, hjust = 1)) +
+  coord_fixed() +
+  labs(title = "County-Level Correlation Matrix Heatmap (Kendall's Tau)",
+       x = "Variables", y = "Variables")
+```
+```
+
+-   Counties with more multi-unit housing tend to have lower Republican vote fractions. This suggests a urban-rural divide in voting patterns.
+
+**Asian Population (RHI425214)**: Strong negative correlation (-0.3646, p \< 0.001)
+
+-   Counties with higher Asian populations tend to have lower Republican vote fractions.
+
+**Accommodation and Food Services Sales (AFN120207)**: Strong negative correlation (-0.3518, p \< 0.001)
+
+-   Counties with higher sales in this sector tend to have lower Republican vote fractions.
+
+-   This might indicate more urbanized or tourist-oriented areas leaning Democratic.
+
+**Building Permits (BPS030214)**, **Private Nonfarm Establishments (BZA010213)**, and **Private Nonfarm Employment (BZA110213)**: Strong negative correlations
+
+-   These all suggest that areas with more economic activity and development tend to have lower Republican vote fractions.
+
+**Black-Owned Firms (SBO315207)**: Strong negative correlation (-0.3305, p \< 0.001)
+
+-   Counties with a higher percentage of Black-owned firms tend to have lower Republican vote fractions.
+
+**Population** and **Housing Units**: Strong negative correlations
+
+-   More populous counties and those with more housing units tend to have lower Republican vote fractions.
+
+**White Population (RHI125214)** and **White Non-Hispanic Population (RHI825214)**: Strong positive correlations
+
+-   Counties with higher percentages of white residents tend to have higher Republican vote fractions.
+
+**Education (EDU685213)**: Negative correlation (-0.2827, p \< 0.001)
+
+-   Counties with higher percentages of bachelor's degree holders tend to have lower Republican vote fractions.
+
+**Homeownership Rate (HSG445213)**: Positive correlation (0.2571, p \< 0.001)
+
+-   Counties with higher homeownership rates tend to have higher Republican vote fractions.
+
+**Foreign-Born Population (POP645213)** and **Non-English Speaking Households (POP815213)**: Negative correlations
+
+-   Counties with more diverse populations tend to have lower Republican vote fractions.
+
+**Income (INC910213, INC110213)**: Weak negative correlations
+
+-   There's a slight tendency for counties with higher incomes to have lower Republican vote fractions, but the relationship is not strong.
+
+**Age Demographics:**
+
+**Older Population (AGE775214)**: Positive correlation (0.2228, p \< 0.001) Y**outh Population (AGE295214)**: Very weak positive correlation (0.0413, p \< 0.001)
+
+-   This suggests that counties with older populations tend to have slightly higher Republican vote fractions.
+
+**Key Observations:**
+
+-   Urban-Rural Divide: Urban characteristics (multi-unit housing, population density, economic activity) are strongly associated with lower Republican vote fractions.
+
+-   Diversity: More diverse counties (higher Asian, Black, foreign-born populations) tend to have lower Republican vote fractions.
+
+-   Education: Higher education levels are associated with lower Republican vote fractions.
+
+-   Age: Counties with older populations tend to have slightly higher Republican vote fractions.
+
+-   Economic Factors: Counties with more economic activity and development tend to lean Democratic, but the relationship with income is weak.
+
+## Comparing state and county level results
+
+When comparing the correlation results from state-level and county-level data, we can observe several interesting similarities and differences:
+
+**Similarities**:
+
+1.  Urban-Rural Divide: Both datasets show that urban characteristics (multi-unit housing, population density) are associated with lower Republican vote fractions.
+
+2.  Diversity: Both state and county levels indicate that areas with higher diversity (Asian population, foreign-born population) tend to have lower Republican vote fractions.
+
+3.  Education: Higher education levels are consistently associated with lower Republican vote fractions at both levels.
+
+4.  White Population: Both datasets show a positive correlation between the percentage of white (non-Hispanic) residents and Republican vote fractions.
+
+5.  Housing: Multi-unit housing structures are negatively correlated with Republican vote fractions at both levels.
+
+**Differences**:
+
+1.  Strength of Correlations: Generally, state-level correlations appear stronger than county-level correlations. This could be due to aggregation effects or the difference in sample sizes.
+
+2.  Income: At the state level, income shows a moderate negative correlation with Republican vote fractions, while at the county level, this correlation is much weaker.
+
+3.  Age Demographics:
+
+    -   State level shows a moderate positive correlation between youth population and Republican votes.
+
+    -   County level shows a very weak positive correlation for youth, but a stronger positive correlation for older populations.
+
+4.  Economic Activity: County-level data shows stronger correlations between economic activity indicators (like building permits, private establishments) and voting patterns, which are not as prominent in the state-level analysis.
+
+5.  Homeownership: This factor appears more significant at the county level (positive correlation with Republican votes) than at the state level.
+
+6.  Specific Factors: Some factors like Accommodation and Food Services Sales or Black-Owned Firms show strong correlations at the county level but are not prominent in the state-level analysis.
+
+**Key Insights**:
+
+1.  Scale Effect: The differences suggest that some relationships may be more pronounced or different when analyzed at different geographic scales (state vs. county).
+
+2.  Aggregation Impact: State-level data might mask some of the nuances visible at the county level, particularly in terms of economic activity and specific demographic factors.
+
+3.  Consistency in Major Trends: Despite the differences, the overall trends regarding urbanization, diversity, and education are consistent across both levels.
+
+4.  Granularity of County Data: County-level data provides a more detailed picture of local factors influencing voting patterns, which might be averaged out in state-level analyses.
+
+These comparisons underscore the complexity of voting behaviors and the importance of considering geographic scale in political and demographic analyses. They also suggest that while some broad trends hold across different levels of analysis, local and regional factors can significantly influence voting patterns at the county level.
+
+# Conclusion 1
+
+Based on the statistical tests and correlation analyses for both state and county level data, we can draw several key insights:
+
+1.  Urban-Rural Divide:
+    -   Both state and county levels show a strong association between urban characteristics and lower Republican vote fractions.
+    -   Factors like multi-unit housing, population density, and economic activity are consistently negatively correlated with Republican voting.
+2.  Education:
+    -   Higher education levels (percentage of bachelor's degree holders) are strongly associated with lower Republican vote fractions at both state and county levels.
+3.  Diversity:
+    -   More diverse areas (higher percentages of Asian, Black, and foreign-born populations) tend to have lower Republican vote fractions.
+    -   This trend is consistent across both state and county levels.
+4.  Income:
+    -   At the state level, income shows a moderate negative correlation with Republican voting.
+    -   At the county level, this relationship is weaker, suggesting income may be a less reliable predictor at the local level.
+5.  Race:
+    -   Areas with higher percentages of white, non-Hispanic residents tend to have higher Republican vote fractions at both levels.
+6.  Housing:
+    -   Higher housing values and more multi-unit structures are associated with lower Republican vote fractions.
+    -   Higher homeownership rates are associated with higher Republican vote fractions, particularly at the county level.
+7.  Age Demographics:
+    -   Results are mixed. At the state level, a higher youth population correlates with higher Republican votes.
+    -   At the county level, older populations show a slight positive correlation with Republican voting.
+8.  Economic Activity:
+    -   Counties with more economic activity (building permits, private establishments, employment) tend to lean Democratic.
+    -   This trend is more pronounced at the county level than at the state level.
+9.  Business Ownership:
+    -   Areas with higher percentages of minority-owned and women-owned businesses tend to have lower Republican vote fractions.
+10. Scale Differences:
+    -   Some relationships (e.g., income, age demographics) appear different when analyzed at state versus county levels, highlighting the importance of considering geographic scale in political analysis.
+11. Strength of Associations:
+    -   Generally, correlations appear stronger at the state level compared to the county level, possibly due to aggregation effects.
+12. Complexity of Voting Behavior:
+    -   The results demonstrate that voting patterns are influenced by a complex interplay of demographic, economic, and social factors.
+13. Consistency in Major Trends:
+    -   Despite some differences, major trends regarding urbanization, diversity, and education are consistent across both levels of analysis.
+14. Statistical Significance:
+    -   Many factors show statistically significant associations with voting patterns, even after adjusting for multiple comparisons.
+15. Effect Sizes:
+    -   Effect sizes vary, with some factors showing strong effects and others showing weak or negligible effects, emphasizing the need to consider practical significance alongside statistical significance.
+
+These insights suggest that voting patterns are influenced by a complex interplay of geographic, demographic, economic, and social factors. The consistency of many trends across state and county levels reinforces their importance, while differences between levels highlight the nuanced nature of political geography in the United States.
+
+# Conclusion 2
+
+Based on the statistical tests and correlation analysis at both the state and county levels, we can draw several key conclusions regarding the socio-economic factors and their association with voting preferences in the 2016 Presidential Election. These conclusions are categorized into three main areas: urban-rural divide, diversity, and socio-economic status.
+
+### Urban-Rural Divide
+
+**State Level Analysis:** - States with higher median values of owner-occupied housing units (HSG495213), higher percentages of multi-unit housing (HSG096213), and higher population density (POP060210) tend to have lower fractions of votes for the Republican party. - Urban characteristics such as higher education levels (EDU685213), more economic activity (e.g., sales value, private nonfarm establishments), and greater diversity are associated with lower Republican vote fractions.
+
+**County Level Analysis:** - Counties with more multi-unit housing (HSG096213), higher building permits (BPS030214), and higher private nonfarm establishments (BZA010213) tend to have lower Republican vote fractions. - Urbanized or tourist-oriented areas, indicated by higher sales in accommodation and food services (AFN120207), tend to lean Democratic.
+
+### Diversity
+
+**State Level Analysis:** - States with higher percentages of the Asian population (RHI425214), foreign-born population (POP645213), and Asian-owned firms (SBO215207) tend to have lower Republican vote fractions. - Indicators of diversity, such as the percentage of Asian population and foreign-born persons, are associated with lower Republican vote fractions.
+
+**County Level Analysis:** - Counties with higher percentages of the Asian population (RHI425214), Black-owned firms (SBO315207), and non-English speaking households (POP815213) tend to have lower Republican vote fractions. - More diverse counties, indicated by higher percentages of Black, Asian, and foreign-born populations, lean Democratic.
+
+### Socio-Economic Status
+
+**State Level Analysis:** - Higher education levels (EDU685213) and higher per capita and median household incomes (INC910213, INC110213) are associated with lower Republican vote fractions. - States with higher socio-economic status, such as higher education and income levels, tend to vote more Democratic.
+
+**County Level Analysis:** - Counties with higher percentages of bachelor's degree holders (EDU685213) and higher incomes (INC910213, INC110213) tend to have lower Republican vote fractions. - The homeownership rate (HSG445213) is positively correlated with Republican vote fractions, suggesting that counties with higher homeownership rates tend to vote Republican.
+
+### Age Demographics
+
+**State Level Analysis:** - States with a higher percentage of persons under 18 years (AGE295214) tend to have higher Republican vote fractions. - A higher percentage of the white non-Hispanic population (RHI825214) is associated with higher Republican vote fractions.
+
+**County Level Analysis:** - Counties with older populations (AGE775214) tend to have slightly higher Republican vote fractions, whereas the correlation with youth population (AGE295214) is very weak.
+
+### Key Observations
+
+1.  **Urban Characteristics and Voting Preferences:**
+    -   Urban areas, characterized by higher housing values, population density, and multi-unit housing, tend to vote Democratic.
+    -   Economic activity and development, indicated by building permits and private nonfarm establishments, are associated with Democratic voting preferences.
+2.  **Diversity and Voting Preferences:**
+    -   Higher diversity in states and counties, indicated by higher percentages of Asian, Black, and foreign-born populations, is associated with Democratic voting preferences.
+3.  **Socio-Economic Status and Voting Preferences:**
+    -   Higher education and income levels are consistently associated with Democratic voting preferences at both the state and county levels.
+    -   Homeownership rates are positively correlated with Republican voting preferences at the county level.
+4.  **Age Demographics and Voting Preferences:**
+    -   Older populations tend to vote Republican, while the impact of youth population on voting preferences is weak and inconsistent.
+
+### Conclusion
+
+Overall, the analysis suggests that urban characteristics, diversity, and higher socio-economic status are associated with Democratic voting preferences, while rural characteristics, lower diversity, and lower socio-economic status are associated with Republican voting preferences. These findings highlight the importance of socio-economic and demographic factors in understanding voting behavior in the 2016 Presidential Election.

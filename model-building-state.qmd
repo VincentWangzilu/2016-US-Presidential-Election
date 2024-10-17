@@ -1,0 +1,1506 @@
+---
+title: "Model Building"
+author: 
+  name: Zilu Wang
+  affiliation: University of Glasgow
+number-sections: true
+format: 
+  html:
+    embed-resources: true
+    code-tools: true
+  pdf: 
+    documentclass: article
+    fontsize: 11pt
+    geometry: margin=1in
+    linestretch: 1.5
+    keep-tex: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-caption: true
+editor_options: 
+  chunk_output_type: console
+execute:
+  echo: false
+  eval: true
+  warning: false
+  message: false
+---
+
+# Model Building
+
+## Generalized Linear Model
+
+### Data Pre-processing
+
+```{r}
+## Read datasets
+PresElect2016R <- read_csv("PresElect2016R copy.csv")
+UScounty_facts <- read_csv("UScounty-facts.csv", locale = locale(encoding = "ISO-8859-1"))
+dictionary <- read_csv("UScounty-dictionary.csv")
+```
+
+In order to predict the winning party for each state for the 2016 presidential election, there are generally 2 ways.
+
+The first one is straight forward. Use state level data (51 rows) and build binary classification models to predict the winning party.The downside of this approach is small sample size, only 51 observations, which may lead to overfitting. We are losing a lot of information by aggregating the data at the state level.
+
+The second approach is to use county level data (3141 rows) and build a regression model to predict the Republican vote share. We can then use the predicted vote share and the population of each county to determine the winning party for each state. This approach has the advantage of using more data, but it is more complex as it involves predicting a continuous variable and then converting it to a binary outcome.
+
+We will try both methods and compare the results.
+
+```{r}
+# Rename columns in PresElect2016R
+votes_by_county <- PresElect2016R |>
+  rename(
+    state = state,
+    state.po = state.po,
+    county = county,
+    fips = FIPS,
+    votesR = candidatevotesR,
+    votesD = candidatevotesD, 
+    fracR = fracvotesR
+  )
+
+#Add columns fracD, totalvotes, winning_party to the votes_by_county dataframe.
+votes_by_county <- votes_by_county |>
+  mutate(
+    fracD = votesD / totalvotes,
+    frac_diff = abs(fracR - fracD),
+    totalvotes = votesR + votesD,
+    winning_party = ifelse(fracR > fracD, "Republican", "Democratic")
+  )
+
+votes_by_state <- votes_by_county %>%
+  group_by(state, state.po) %>%
+  summarise(
+    totalvotes = sum(totalvotes, na.rm = TRUE),
+    votesR = sum(votesR, na.rm = TRUE),
+    votesD = sum(votesD, na.rm = TRUE),
+    fracR = votesR / totalvotes,
+    fracD = votesD / totalvotes,
+    frac_diff = abs(fracR - fracD), 
+    partywonR = ifelse(votesR > votesD, 1, 0),
+    winning_party = if_else(fracR > fracD, "Republican", "Democratic")
+  )
+
+state_facts <- UScounty_facts |>
+  filter(is.na(state_abbreviation)) |>
+  rename(state = area_name) |>
+  select(-state_abbreviation, -fips)
+
+county_facts <- UScounty_facts |>
+  filter(!is.na(state_abbreviation)) |>
+  rename(county = area_name)
+
+state_facts$state <- ifelse(state_facts$state == "District Of Columbia", "District of Columbia", state_facts$state)
+merged_data_state <- merge(votes_by_state, state_facts, by = "state")
+merged_data_state <- merge(merged_data_state, state_info, by = "state") |>
+  select(-region)
+merged_data_state$winning_party <- as.factor(merged_data_state$winning_party)
+
+# Merge votes_by_county with county_facts by fips
+merged_data_county <- left_join(votes_by_county, county_facts, by = "fips") 
+merged_data_county <- merged_data_county |>
+  filter(complete.cases(county.y)) |>
+  select(-county.y, -state_abbreviation) |>
+  rename(county = county.x)
+merged_data_county$winning_party <- as.factor(merged_data_county$winning_party)
+
+# merge merged_data_county with state_info by state
+merged_data_county <- merge(merged_data_county, state_info, by = "state") |>
+  select(-region)
+
+```
+
+```{r}
+# Select columns
+model_data <- merged_data_state[, c("winning_party", dictionary$column_name)]
+# scale the numeric columns
+model_data_scaled <- model_data %>%
+  mutate(across(where(is.numeric), scale))
+```
+
+### PCA
+
+```{r}
+# PCA
+model_data_X <- model_data_scaled[, dictionary$column_name]
+pca <- prcomp(model_data_X, scale = FALSE, center = TRUE)
+summary(pca)
+# Produce scree plot
+fviz_eig(pca, addlabels = TRUE)
+# biplot
+fviz_pca_biplot(pca, label = "var", col.var = "black", repel = TRUE)
+```
+### PCA Analysis
+```{r}
+library("ggrepel")
+# Select columns
+model_data <- merged_data_state[, c("winning_party", dictionary$column_name)]
+
+# scale the numeric columns
+model_data_scaled <- model_data %>%
+  mutate(across(where(is.numeric), scale))
+
+# Perform PCA
+pca_result <- prcomp(model_data_scaled[, -which(names(model_data_scaled) == "winning_party")], center = TRUE, scale. = TRUE)
+
+# Visualize variance explained
+fviz_eig(pca_result, addlabels = TRUE)
+fviz_pca_biplot(pca_result, label = "var", col.var = "black", repel = TRUE)
+
+# Select number of components that explain 80% of variance
+variance_explained <- cumsum(pca_result$sdev^2 / sum(pca_result$sdev^2))
+num_components <- which(variance_explained >= 0.8)[1]
+
+# Get the top contributing variables for each selected component
+top_contributors <- lapply(1:num_components, function(i) {
+  loadings <- pca_result$rotation[, i]
+  
+  # Get top 5 positive contributors
+  top_pos <- names(sort(loadings, decreasing = TRUE)[1:5])
+  pos_df <- data.frame(PC = paste0("PC", i), Variable = top_pos, Loading = loadings[top_pos], Type = "Positive")
+  
+  # Get top 5 negative contributors
+  top_neg <- names(sort(loadings, decreasing = FALSE)[1:5])
+  neg_df <- data.frame(PC = paste0("PC", i), Variable = top_neg, Loading = loadings[top_neg], Type = "Negative")
+  
+  # Combine positive and negative contributors
+  rbind(pos_df, neg_df)
+})
+top_contributors_df <- do.call(rbind, top_contributors)
+print(top_contributors_df)
+
+# Create new dataset with selected principal components
+pca_data <- as.data.frame(predict(pca_result, newdata = model_data_scaled[, -which(names(model_data_scaled) == "winning_party")]))
+pca_data <- pca_data[, 1:num_components]
+pca_data$winning_party <- model_data_scaled$winning_party
+
+# Fit logistic regression model using principal components
+pca_model <- glm(winning_party ~ ., data = pca_data, family = binomial)
+
+# Print summary of the model
+summary(pca_model)
+
+# Interpret the results
+cat("\nInterpretation:\n")
+for (i in 1:num_components) {
+  if (summary(pca_model)$coefficients[paste0("PC", i), "Pr(>|z|)"] < 0.2) {
+    cat(paste0("PC", i, " is significant. It primarily represents:\n"))
+    pc_contributors <- top_contributors_df[top_contributors_df$PC == paste0("PC", i), ]
+    cat("Positive contributors:\n")
+    print(pc_contributors[pc_contributors$Type == "Positive", c("Variable", "Loading")])
+    cat("\nNegative contributors:\n")
+    print(pc_contributors[pc_contributors$Type == "Negative", c("Variable", "Loading")])
+    cat("\n")
+  }
+}
+
+
+pca_coords <- as.data.frame(pca_result$x[, 1:2])
+pca_coords$state_abbr <- votes_by_state$state.po
+# Create the plot
+pca_plot <- fviz_pca_ind(pca_result, col.ind = "cos2", 
+                         gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+                         repel = TRUE)
+
+# Add state abbreviations using ggrepel for smart label placement
+pca_plot + 
+  geom_text_repel(data = pca_coords, 
+                  aes(x = PC1, y = PC2, label = state_abbr),
+                  size = 3,
+                  box.padding = 0.5,
+                  point.padding = 0.1,
+                  segment.color = 'grey50') +
+  theme_minimal() +
+  labs(title = "PCA of Socio-economic Factors by State",
+       subtitle = "State abbreviations added to each point")
+
+# If you prefer labels with backgrounds, use geom_label_repel instead:
+# geom_label_repel(data = pca_coords, 
+#                  aes(x = PC1, y = PC2, label = state_abbr),
+#                  size = 3,
+#                  box.padding = 0.5,
+#                  point.padding = 0.1,
+#                  segment.color = 'grey50')
+```
+
+```{r}
+library(plotly)
+library(tidyverse)
+
+# Assuming you've already performed PCA and have pca_result
+
+# Extract the first three principal components
+pca_data_3d <- as.data.frame(predict(pca_result, newdata = model_data_scaled[, -which(names(model_data_scaled) == "winning_party")]))
+pca_data_3d <- pca_data_3d[, 1:3]
+pca_data_3d$winning_party <- model_data_scaled$winning_party
+
+# Create the 3D scatter plot
+plot_3d <- plot_ly(pca_data_3d, 
+                   x = ~PC1, 
+                   y = ~PC2, 
+                   z = ~PC3, 
+                   color = ~winning_party,
+                   colors = c("blue", "red"),
+                   type = "scatter3d",
+                   mode = "markers") %>%
+  layout(scene = list(xaxis = list(title = "PC1"),
+                      yaxis = list(title = "PC2"),
+                      zaxis = list(title = "PC3")),
+         title = "First Three Principal Components")
+
+# Display the plot
+plot_3d
+
+# If you want to save the plot as an HTML file for interactive viewing later
+# htmlwidgets::saveWidget(plot_3d, "pca_3d_plot.html")
+
+# Add labels for each point (state names)
+pca_data_3d$state <- rownames(model_data_scaled)
+
+plot_3d_labeled <- plot_ly(pca_data_3d, 
+                           x = ~PC1, 
+                           y = ~PC2, 
+                           z = ~PC3, 
+                           color = ~winning_party,
+                           colors = c("blue", "red"),
+                           type = "scatter3d",
+                           mode = "markers+text",
+                           text = ~state,
+                           textposition = "top center") %>%
+  layout(scene = list(xaxis = list(title = "PC1"),
+                      yaxis = list(title = "PC2"),
+                      zaxis = list(title = "PC3")),
+         title = "First Three Principal Components with State Labels")
+
+# Display the labeled plot
+plot_3d_labeled
+
+# Save the labeled plot
+# htmlwidgets::saveWidget(plot_3d_labeled, "pca_3d_plot_labeled.html")
+```
+### PCA conclusions
+Based on the PCA analysis results you've provided, we can draw several important conclusions:
+
+Model Significance:
+
+The logistic regression model using the principal components is statistically significant, as indicated by the reduction in deviance from the null model (69.104) to the residual deviance (12.247).
+The AIC of 24.247 suggests a relatively good fit, considering the complexity of the model.
+
+
+Significant Principal Components:
+
+PC1, PC2, PC4, and PC5 are marginally significant (at the 0.1 level), indicating they have some predictive power for the winning party.
+
+
+Interpretation of Significant PCs:
+PC1 (p = 0.0827):
+
+Negatively associated with Republican winning (coefficient -0.5625)
+Represents economic activity and population size (AFN120207, NES010213, SBO001207, PST045214, RTN130207)
+Suggests that areas with higher economic activity and larger populations tend to lean Democratic
+
+PC2 (p = 0.0608):
+
+Strongly negatively associated with Republican winning (coefficient -5.8274)
+Represents housing value, Asian population, diversity, income, and Asian-owned businesses
+Indicates that areas with higher housing values, more diverse populations, higher incomes, and more Asian-owned businesses tend to lean Democratic
+
+PC4 (p = 0.0778):
+
+Positively associated with Republican winning (coefficient 2.3556)
+Represents poverty, African American population, Black-owned businesses, retail sales per capita, and young children
+Suggests a complex relationship where areas with higher poverty rates, larger African American populations, more Black-owned businesses, higher retail sales per capita, and more young children tend to lean Republican
+
+PC5 (p = 0.1689):
+
+Negatively associated with Republican winning (coefficient -3.7720)
+Represents Native Hawaiian/Pacific Islander-owned businesses, per capita income, Native Hawaiian/Pacific Islander population, education level, and Asian-owned businesses
+Indicates that areas with higher representation of these factors tend to lean Democratic
+
+
+## Feature Selection
+
+```{r}
+feature_set1 <- c("RHI825214", "HSG495213", "AGE775214")
+
+feature_set2 <- c("AGE295214", "EDU685213", "RHI825214", "HSG445213", "INC910213")
+
+feature_set3 <- c("POP060210", "EDU685213", "HSG096213", "RHI425214")
+
+feature_set4 <- c("PST045214", "LFE305213", "HSG445213")
+
+feature_set5 <- c("POP060210", "AGE295214", "RHI825214", "EDU685213", "HSG495213")
+
+feature_set6 <- c("INC110213", "HSG495213", "AGE775214")
+
+feature_set7 <- c("RHI825214", "HSG495213", "AGE295214", "EDU685213", "LFE305213", "PST045214")
+
+feature_set_lasso <-c("AGE135214", "AGE295214", "RHI425214", "POP645213", "EDU685213", "LFE305213", "INC110213", "SBO015207")
+```
+
+From the Biplot we see that population (2010, 2014) is highly correlated with housing number, sales (manufacture, whosale, retail), and number of firms.
+
+Then we see vairiables describing housing, income, education, and racial diversity are closely related.
+
+The variables are roughly separated into 5 groups, I will pick the most representative variable from each group to include in the logistic regression model.
+
+POP645213 (Immigration), EDU685213 (Education), PST045214 (Population), HSG495213 (Housing), RHI825214 (White population)
+
+### Correlation Heatmap
+
+```{r}
+library(ggcorrplot)
+
+# Specify the indicators to use in the model
+indicators <- c("POP645213", "EDU685213", "PST045214", "HSG495213", "RHI825214")
+
+# Compute the correlation matrix
+cor_matrix <- cor(merged_data_state[, indicators], use = "complete.obs")
+
+# Define the custom colorscale
+custom_colorscale <- c("blue", "white", "red")
+
+# Create the heatmap
+heatmap_plot <- ggcorrplot(cor_matrix, 
+                           lab = TRUE, 
+                           colors = custom_colorscale, 
+                           outline.color = "black")
+
+# Show the plot
+print(heatmap_plot)
+```
+
+## GLM
+
+### Logistic Regression with 5 PCs
+```{r}
+# Create new dataset with selected principal components
+pca_data <- as.data.frame(predict(pca_result, newdata = model_data_scaled[, -which(names(model_data_scaled) == "winning_party")]))
+pca_data <- pca_data[, 1:num_components]
+pca_data$winning_party <- model_data_scaled$winning_party
+
+# Ensure winning_party is a factor
+pca_data$winning_party <- as.factor(pca_data$winning_party)
+
+set.seed(1234)
+# Set up train control for LOOCV
+ctrl <- trainControl(method = "LOOCV", 
+                     classProbs = TRUE, 
+                     summaryFunction = twoClassSummary)
+
+# Train the model
+model <- train(winning_party ~ ., 
+               data = pca_data, 
+               method = "glm", 
+               family = "binomial",
+               trControl = ctrl,
+               metric = "ROC")
+
+# Get predictions
+predictions <- predict(model, pca_data)
+prob_predictions <- predict(model, pca_data, type = "prob")
+
+# Calculate performance metrics
+conf_matrix <- confusionMatrix(predictions, pca_data$winning_party)
+print(conf_matrix)
+accuracy <- conf_matrix$overall['Accuracy']
+precision <- conf_matrix$byClass['Pos Pred Value']
+recall <- conf_matrix$byClass['Sensitivity']
+f1_score <- conf_matrix$byClass['F1']
+
+# Calculate AUC
+roc_obj <- roc(pca_data$winning_party, prob_predictions[, "Republican"])
+auc <- auc(roc_obj)
+
+# Print results
+cat("Accuracy:", accuracy, "\n")
+cat("Precision:", precision, "\n")
+cat("Recall:", recall, "\n")
+cat("F1 Score:", f1_score, "\n")
+cat("AUC:", auc, "\n")
+
+# Print the summary of the model
+print(summary(model$finalModel))
+```
+
+### Logistic Regression selected features
+
+```{r}
+set.seed(1234)
+feature_set3 = c("PST045214", "HSG495213", "SEX255214", "PVY020213", "EDU635213")
+model_data <- merged_data_state[, c("winning_party", feature_set3)]
+# Scale the numeric columns
+model_data_scaled <-  model_data %>%
+  mutate(across(where(is.numeric), scale))
+
+# Ensure the response variable is a factor
+model_data_scaled <- model_data_scaled %>%
+  mutate(winning_party = as.factor(winning_party))
+
+# apply 5-fold cross-validation with 5 features
+train_control <- trainControl(method = "LOOCV", savePredictions = TRUE, classProbs = TRUE)
+
+
+# Fit the model using the cross-validation
+model_glm_cv <- train(winning_party ~., data = model_data_scaled, method = "glm", family = binomial, trControl = train_control)
+
+# Extract the predictions and observed values from the cross-validation
+predictions <- model_glm_cv$pred$pred
+observed <- model_data_scaled$winning_party[model_glm_cv$pred$rowIndex]
+
+# Confusion matrix
+conf_matrix <- confusionMatrix(predictions, observed)
+print(conf_matrix)
+
+# Calculate accuracy, precision, recall, and F1 score
+accuracy <- conf_matrix$overall['Accuracy']
+precision <- conf_matrix$byClass['Pos Pred Value']
+recall <- conf_matrix$byClass['Sensitivity']
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+cat("Accuracy: ", accuracy, "\n")
+cat("Precision: ", precision, "\n")
+cat("Recall: ", recall, "\n")
+cat("F1 Score: ", f1_score, "\n")
+
+# Plot ROC Curve
+roc_obj <- roc(observed, as.numeric(predictions))
+plot(roc_obj)
+auc_value <- auc(roc_obj)
+cat("AUC: ", auc_value, "\n")
+
+
+vif(model_glm_cv$finalModel)
+summary(model_glm_cv$finalModel)
+```
+
+```{r}
+set.seed(1234)
+feature_set3 = c("AGE295214", "EDU685213", "RHI825214")
+model_data <- merged_data_state[, c("winning_party", feature_set3)]
+
+# Scale the numeric columns
+model_data_scaled <- model_data %>%
+  mutate(across(where(is.numeric), scale))
+
+# Ensure the response variable is a factor
+model_data_scaled <- model_data_scaled %>%
+  mutate(winning_party = as.factor(winning_party))
+
+# Apply 5-fold cross-validation
+train_control <- trainControl(method = "cv", 
+                              number = 5, 
+                              savePredictions = TRUE, 
+                              classProbs = TRUE)
+
+# Fit the model using 5-fold cross-validation
+model_glm_cv <- train(winning_party ~ ., 
+                      data = model_data_scaled, 
+                      method = "glm", 
+                      family = binomial, 
+                      trControl = train_control)
+
+# Extract the predictions and observed values from the cross-validation
+predictions <- model_glm_cv$pred$pred
+observed <- model_glm_cv$pred$obs
+
+# Confusion matrix
+conf_matrix <- confusionMatrix(predictions, observed)
+print(conf_matrix)
+
+# Calculate accuracy, precision, recall, and F1 score
+accuracy <- conf_matrix$overall['Accuracy']
+precision <- conf_matrix$byClass['Pos Pred Value']
+recall <- conf_matrix$byClass['Sensitivity']
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+cat("Accuracy: ", accuracy, "\n")
+cat("Precision: ", precision, "\n")
+cat("Recall: ", recall, "\n")
+cat("F1 Score: ", f1_score, "\n")
+
+# Plot ROC Curve
+roc_obj <- roc(observed, as.numeric(predictions == "Republican"))
+plot(roc_obj, main = "ROC Curve")
+auc_value <- auc(roc_obj)
+cat("AUC: ", auc_value, "\n")
+
+# Calculate VIF
+vif_values <- vif(model_glm_cv$finalModel)
+print("Variance Inflation Factors:")
+print(vif_values)
+
+# Print model summary
+cat("\nModel Summary:\n")
+print(summary(model_glm_cv$finalModel))
+```
+
+
+```{r}
+set.seed(1234)
+# Define the feature sets
+feature_sets <- list(
+  feature_set1 = c("RHI825214", "HSG495213", "AGE775214"),
+  feature_set2 = c("AGE295214", "EDU685213", "RHI825214"),
+  feature_set3 = c("POP060210", "EDU685213", "RHI425214"),
+  feature_set4 = c("PST045214", "LFE305213", "HSG445213"),
+  feature_set5 = c("POP060210", "AGE295214", "RHI825214", "HSG495213"),
+  feature_set6 = c("INC110213", "HSG495213", "AGE775214"),
+  feature_set7 = c("RHI825214", "HSG495213", "AGE295214", "EDU685213", "LFE305213", "PST045214"),
+  feature_set_8 = c("HSG495213", "AGE775214", "EDU685213", "RHI825214", "PST045214", "LFE305213", "HSG445213", "POP060210")
+)
+
+# Initialize an empty dataframe to store the results
+results_df <- data.frame(
+  Feature_Set = character(),
+  Accuracy = numeric(),
+  Precision = numeric(),
+  Recall = numeric(),
+  F1_Score = numeric(),
+  AUC = numeric(),
+  AIC = numeric(),
+  P_Values = character(),
+  stringsAsFactors = FALSE
+)
+
+# Set up the control for LOOCV
+train_control <- trainControl(method = "LOOCV", savePredictions = TRUE, classProbs = TRUE)
+
+# Loop through each feature set
+for (feature_set_name in names(feature_sets)) {
+  feature_set <- feature_sets[[feature_set_name]]
+  
+  # Prepare the data
+  model_data <- merged_data_state[, c("winning_party", feature_set)]
+  
+  # Scale the numeric columns
+  model_data_scaled <- model_data %>%
+    mutate(across(where(is.numeric), scale))
+  
+  # Ensure the response variable is a factor
+  model_data_scaled <- model_data_scaled %>%
+    mutate(winning_party = as.factor(winning_party))
+  
+  # Fit the model using the cross-validation
+  model_glm_cv <- train(winning_party ~ ., data = model_data_scaled, method = "glm", family = binomial, trControl = train_control)
+  
+  # Extract the predictions and observed values from the cross-validation
+  predictions <- model_glm_cv$pred$pred
+  observed <- model_glm_cv$pred$obs
+  
+  # Confusion matrix
+  conf_matrix <- confusionMatrix(predictions, observed)
+  
+  # Calculate performance metrics
+  accuracy <- conf_matrix$overall['Accuracy']
+  precision <- conf_matrix$byClass['Pos Pred Value']
+  recall <- conf_matrix$byClass['Sensitivity']
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  
+  # Plot ROC Curve and calculate AUC
+  roc_obj <- roc(observed, as.numeric(predictions))
+  auc_value <- auc(roc_obj)
+  
+  # Extract AIC and p-values
+  print(summary(model_glm_cv$finalModel))
+  print(vif(model_glm_cv$finalModel))
+
+
+  
+  # Store the results in the dataframe
+  results_df <- rbind(results_df, data.frame(
+    Feature_Set = feature_set_name,
+    Accuracy = accuracy,
+    Precision = precision,
+    Recall = recall,
+    F1_Score = f1_score,
+    AUC = auc_value,
+    stringsAsFactors = FALSE
+  ))
+}
+
+# Print the results
+print(results_df)
+```
+
+### Stepwise Selection
+
+```{r}
+# Load required libraries
+library(MASS)
+library(caret)
+set.seed(1234)
+
+# Prepare the data
+model_data <- merged_data_state[, c("winning_party", dictionary$column_name)]
+
+# scale the numeric columns
+model_data_scaled <- model_data %>%
+  mutate(across(where(is.numeric), scale))
+# set winning_party as factor
+model_data_scaled$winning_party <- as.factor(model_data_scaled$winning_party)
+
+predictors <- model_data_scaled[, -1]
+target <- model_data_scaled$winning_party
+
+# Custom stepwise function for AIC with p-value constraint
+stepwise_aic_pvalue <- function(data, response, alpha = 0.1) {
+  variables <- colnames(data)[colnames(data) != response]
+  model <- glm(paste(response, "~ 1"), data = data, family = binomial)
+  
+  while(length(variables) > 0) {
+    improvements <- sapply(variables, function(v) {
+      new_model <- update(model, as.formula(paste(". ~ . +", v)))
+      if (max(summary(new_model)$coefficients[-1, "Pr(>|z|)"]) < alpha) {
+        return(AIC(model) - AIC(new_model))
+      } else {
+        return(-Inf)
+      }
+    })
+    
+    best <- which.max(improvements)
+    if (improvements[best] > 0) {
+      model <- update(model, as.formula(paste(". ~ . +", variables[best])))
+      variables <- variables[-best]
+    } else {
+      break
+    }
+  }
+  
+  return(model)
+}
+
+# Perform forward stepwise selection using AIC with p-value constraint
+aic_model <- stepwise_aic_pvalue(model_data_scaled, "winning_party")
+aic_features <- names(coef(aic_model))[-1]  # Exclude intercept
+
+# Perform forward stepwise selection using accuracy
+accuracy_features <- c()
+current_accuracy <- 0
+remaining_features <- colnames(predictors)
+
+while(length(remaining_features) > 0) {
+  best_feature <- NULL
+  best_accuracy <- current_accuracy
+  
+  for(feature in remaining_features) {
+    formula <- as.formula(paste("winning_party ~", paste(c(accuracy_features, feature), collapse = " + ")))
+    model <- glm(formula, data = model_data_scaled, family = binomial)
+    
+    if(max(summary(model)$coefficients[-1, "Pr(>|z|)"]) < 0.1) {
+      cv_results <- train(formula, 
+                          data = model_data_scaled, 
+                          method = "glm", 
+                          family = "binomial",
+                          trControl = trainControl(method = "LOOCV"))
+      
+      if(cv_results$results$Accuracy > best_accuracy) {
+        best_feature <- feature
+        best_accuracy <- cv_results$results$Accuracy
+      }
+    }
+  }
+  
+  if(is.null(best_feature)) break
+  
+  accuracy_features <- c(accuracy_features, best_feature)
+  current_accuracy <- best_accuracy
+  remaining_features <- setdiff(remaining_features, best_feature)
+}
+
+accuracy_model <- glm(as.formula(paste("winning_party ~", paste(accuracy_features, collapse = " + "))),
+                      data = model_data_scaled, family = binomial)
+
+# Function to calculate performance metrics
+calculate_metrics <- function(model, data) {
+  predictions <- predict(model, newdata = data, type = "response")
+  pred_class <- ifelse(predictions > 0.5, "Republican", "Democratic")
+  actual_class <- data$winning_party
+  
+  cm <- confusionMatrix(factor(pred_class), actual_class)
+  
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  f1 <- cm$byClass["F1"]
+  
+  roc <- roc(actual_class, predictions)
+  auc <- auc(roc)
+  
+  return(list(
+    confusion_matrix = cm$table,
+    accuracy = accuracy,
+    precision = precision,
+    recall = recall,
+    f1 = f1,
+    auc = auc
+  ))
+}
+
+# Evaluate AIC model performance
+aic_metrics <- calculate_metrics(aic_model, model_data_scaled)
+print(summary(aic_model))
+
+# Evaluate Accuracy model performance
+accuracy_metrics <- calculate_metrics(accuracy_model, model_data_scaled)
+
+print(summary(accuracy_model))
+
+
+# Perform leave-one-out cross-validation
+perform_loocv <- function(model_formula, data) {
+  n <- nrow(data)
+  predictions <- numeric(n)
+  actual <- numeric(n)
+  
+  for (i in 1:n) {
+    train_data <- data[-i, ]
+    test_data <- data[i, ]
+    
+    model <- glm(model_formula, data = train_data, family = binomial)
+    pred_prob <- predict(model, newdata = test_data, type = "response")
+    predictions[i] <- ifelse(pred_prob > 0.5, 1, 0)
+    actual[i] <- ifelse(test_data$winning_party == "Republican", 1, 0)
+  }
+  
+  cm <- confusionMatrix(factor(predictions), factor(actual))
+  roc <- roc(actual, predictions)
+  auc <- auc(roc)
+  
+  return(list(
+    confusion_matrix = cm$table,
+    accuracy = cm$overall["Accuracy"],
+    precision = cm$byClass["Pos Pred Value"],
+    recall = cm$byClass["Sensitivity"],
+    f1 = cm$byClass["F1"],
+    auc = auc
+  ))
+}
+
+# Perform LOOCV for AIC model
+aic_formula <- as.formula(paste("winning_party ~", paste(aic_features, collapse = " + ")))
+aic_loocv <- perform_loocv(aic_formula, model_data_scaled)
+
+cat("\nAIC Model LOOCV Performance:\n")
+cat("Confusion Matrix:\n")
+print(aic_loocv$confusion_matrix)
+cat("\nAccuracy:", aic_loocv$accuracy)
+cat("\nPrecision:", aic_loocv$precision)
+cat("\nRecall:", aic_loocv$recall)
+cat("\nF1 Score:", aic_loocv$f1)
+cat("\nAUC:", aic_loocv$auc, "\n")
+
+# Perform LOOCV for Accuracy model
+accuracy_formula <- as.formula(paste("winning_party ~", paste(accuracy_features, collapse = " + ")))
+accuracy_loocv <- perform_loocv(accuracy_formula, model_data_scaled)
+
+cat("\nAccuracy Model LOOCV Performance:\n")
+cat("Confusion Matrix:\n")
+print(accuracy_loocv$confusion_matrix)
+cat("\nAccuracy:", accuracy_loocv$accuracy)
+cat("\nPrecision:", accuracy_loocv$precision)
+cat("\nRecall:", accuracy_loocv$recall)
+cat("\nF1 Score:", accuracy_loocv$f1)
+cat("\nAUC:", accuracy_loocv$auc, "\n")
+```
+
+
+### Lasso regression
+```{r}
+library(caret)
+library(glmnet)
+set.seed(1234)
+
+model_data <- merged_data_state[, c("winning_party", dictionary$column_name)]
+# remove variables POP010210 and VET605213
+model_data <- model_data[, !colnames(model_data) %in% c("POP010210", "VET605213")]
+model_data$winning_party <- as.factor(model_data$winning_party)
+
+# Define the control using 5-fold cross-validation
+train_control <- trainControl(method = "LOOCV", savePredictions = TRUE, classProbs = TRUE)
+
+# Define the grid of tuning parameters
+tune_grid <- expand.grid(
+  alpha = 1, # LASSO regularization
+  lambda = seq(0.001, 0.1, by = 0.001) # Adjust the lambda sequence as needed
+)
+
+# Fit the model using cross-validation
+model_lasso_cv <- train(
+  winning_party ~ ., 
+  data = model_data, 
+  method = "glmnet", 
+  trControl = train_control, 
+  tuneGrid = tune_grid)
+
+# Print the best tuning parameters
+best_lambda <- model_lasso_cv$bestTune$lambda
+best_alpha <- model_lasso_cv$bestTune$alpha
+
+cat("Best Lambda: ", best_lambda, "\n")
+
+# Get the cross-validated predictions
+cv_predictions <- model_lasso_cv$pred
+
+# Filter the predictions to get the ones corresponding to the best model
+best_model_predictions <- cv_predictions %>%
+  filter(alpha == best_alpha & lambda == best_lambda)
+
+# Generate the confusion matrix
+conf_matrix <- confusionMatrix(best_model_predictions$pred, best_model_predictions$obs)
+
+# Print the confusion matrix
+print(conf_matrix)
+
+# Calculate additional performance metrics
+accuracy <- conf_matrix$overall['Accuracy']
+precision <- conf_matrix$byClass['Pos Pred Value']
+recall <- conf_matrix$byClass['Sensitivity']
+f1_score <- 2 * (precision * recall) / (precision + recall)
+# calculate AUC
+roc_obj <- roc(best_model_predictions$obs, as.numeric(best_model_predictions$pred))
+print(auc(roc_obj))
+
+cat("Accuracy: ", accuracy, "\n")
+cat("Precision: ", precision, "\n")
+cat("Recall: ", recall, "\n")
+cat("F1 Score: ", f1_score, "\n")
+
+# Extract the coefficients from the best model
+best_model <- model_lasso_cv$finalModel
+coefficients <- coef(best_model, s = best_lambda)
+coefficients_df <- as.data.frame(as.matrix(coefficients))
+coefficients_df <- coefficients_df %>% 
+  rownames_to_column(var = "Variable")
+
+# Print non-zero coefficients
+print(coefficients_df[coefficients_df$s1 != 0, ])
+```
+
+### GLM Conclusions
+Based on the presented results from the logistic regression models with best AIC, highest accuracy, and LASSO regression, we can draw several important conclusions about the socio-economic factors influencing state-level voting patterns in the 2016 U.S. Presidential election.
+The AIC-based model identified three key predictors: median value of owner-occupied housing units (HSG495213), percentage of women-owned firms (SBO015207), and persons per household (HSD310213). This parsimonious model achieved high performance metrics in leave-one-out cross-validation (LOOCV), with an accuracy of 0.9412, precision of 0.95, recall of 0.9048, and AUC of 0.9357. The negative coefficients for housing value and women-owned businesses suggest that states with higher housing values and more women-owned firms were less likely to vote Republican, while the positive coefficient for persons per household indicates that states with larger household sizes were more likely to favor Republican candidates.
+The accuracy-optimized model identified a different set of predictors: percentage of persons with a bachelor's degree or higher (EDU685213), percentage of persons under 5 years old (AGE135214), percentage of Asian population (RHI425214), and number of housing units (HSG010214). This model showed slightly superior performance in LOOCV, with an accuracy of 0.9608, precision and recall both at 0.9524, and AUC of 0.9595. The negative coefficients for education level and Asian population percentage align with previous findings that states with higher education levels and more diverse populations tend to lean Democratic. Interestingly, the positive coefficient for the young child population suggests that states with a higher percentage of young children were more likely to vote Republican, which may reflect broader demographic or family structure differences between Republican and Democratic-leaning states.
+The LASSO regression, which performs both variable selection and regularization, identified six significant predictors: intercept, percentage of persons under 5 years old (AGE135214), language other than English spoken at home (POP815213), percentage with bachelor's degree or higher (EDU685213), median value of owner-occupied housing units (HSG495213), and percentage of women-owned firms (SBO015207). This model achieved good performance with an accuracy of 0.8824, precision of 0.8947, recall of 0.8095, and AUC of 0.8714. The LASSO results reinforce the importance of factors identified in the other models, particularly education level, housing value, and women-owned businesses, while also highlighting the potential influence of linguistic diversity.
+Collectively, these models underscore the complex interplay of demographic, economic, and social factors in shaping state-level voting patterns. Education level, housing value, and business ownership demographics consistently emerge as important predictors across models. The negative association between these factors and Republican voting aligns with broader narratives about the urban-rural and educational divides in American politics. The models also highlight the potential importance of age demographics and diversity indicators in predicting voting outcomes.
+It's noteworthy that all three models achieved high predictive accuracy, with the accuracy-optimized logistic regression performing slightly better in cross-validation. This suggests that a relatively small set of socio-economic indicators can effectively predict state-level voting outcomes, although the specific set of optimal predictors may vary depending on the model selection criteria used.
+These findings contribute to our understanding of the socio-economic correlates of voting behavior at the state level. However, it's important to interpret these results cautiously, considering potential limitations such as the relatively small sample size (51 states including DC) and the possibility of ecological fallacy when inferring individual-level behavior from state-level data. Future research could benefit from incorporating longitudinal data to examine how these relationships evolve over time and from exploring potential interaction effects among the identified predictors.
+## Random Forest
+```{r}
+set.seed(1234)
+# Load necessary libraries
+library(caret)
+library(randomForest)
+library(pdp)
+library(ggplot2)
+library(gridExtra)
+
+model_data <- merged_data_state[, c("winning_party", dictionary$column_name)]
+
+
+# Define the control using 5-fold cross-validation
+train_control <- trainControl(method = "LOOCV", savePredictions = TRUE, classProbs = TRUE)
+
+# Define the grid of tuning parameters
+tune_grid <- expand.grid(
+  mtry = c(1, 2, 3, 4, 5) # Adjust the number of variables tried at each split
+)
+
+# Fit the random forest model using cross-validation
+rf_model <- train(
+  winning_party ~ ., 
+  data = model_data, 
+  method = "rf", 
+  trControl = train_control,
+  tuneGrid = tune_grid
+)
+
+# Print the best tuning parameters
+best_mtry <- rf_model$bestTune$mtry
+cat("Best mtry: ", best_mtry, "\n")
+
+
+# Predict on the training set to get confusion matrix
+predictions <- rf_model$pred
+
+# Filter the predictions to get the ones corresponding to the best model
+best_model_predictions <- predictions %>%
+  filter(mtry == best_mtry)
+
+# Generate the confusion matrix
+conf_matrix <- confusionMatrix(best_model_predictions$pred, best_model_predictions$obs)
+
+print(conf_matrix)
+# Print averaged accuracy, precision, recall, and F1 score
+accuracy <- conf_matrix$overall['Accuracy']
+precision <- conf_matrix$byClass['Pos Pred Value']
+recall <- conf_matrix$byClass['Sensitivity']
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+cat("Accuracy: ", accuracy, "\n")
+cat("Precision: ", precision, "\n")
+cat("Recall: ", recall, "\n")
+cat("F1 Score: ", f1_score, "\n")
+
+# print AUC
+roc_obj <- roc(best_model_predictions$obs, as.numeric(best_model_predictions$pred))
+plot(roc_obj)
+print(auc(roc_obj))
+
+#plot feature importance
+# Extract top 10 feature importance
+importance <- varImp(rf_model, scale = FALSE)
+importance_df <- importance$importance
+importance_df$Variable <- rownames(importance_df)
+importance_df <- importance_df %>%
+  dplyr::select(Variable, Overall) %>%
+  arrange(desc(Overall)) %>%
+  head(10)
+
+# Plot feature importance using ggplot2
+ggplot(importance_df, aes(x = reorder(Variable, Overall), y = Overall)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  xlab("Variables") +
+  ylab("Importance") +
+  ggtitle("Feature Importance from Random Forest Model") +
+  theme_minimal()
+
+# Extract the feature names from importance_df
+top_features <- importance_df$Variable
+
+
+# Arrange PDPs in a grid
+grid_plot <- gridExtra::grid.arrange(grobs = pdp_plots, ncol = 2, 
+                          top = "Partial Dependence Plots for Top 10 Features")
+
+library(gridExtra)
+library(scales)
+# Create a mapping of variable names to descriptions
+variable_descriptions <- c(
+  HSG495213 = "Median House Value ($)",
+  EDU685213 = "Bachelor's Degree or Higher (%)",
+  INC910213 = "Per Capita Income ($)",
+  RHI425214 = "Asian Population (%)",
+  POP645213 = "Foreign-Born Persons (%)",
+  SBO215207 = "Women-Owned Firms (%)",
+  INC110213 = "Median Household Income ($)",
+  LND110210 = "Land Area (sq. miles)",
+  HSG096213 = "Multi-Unit Housing (%)",
+  POP815213 = "Non-English Speakers (%)"
+)
+
+# Create PDPs for top 10 features
+pdp_plots <- list()
+for(feature in top_features) {
+  tryCatch({
+    partial_plot <- partial(rf_model$finalModel, 
+                            pred.var = feature, 
+                            train = model_data,
+                            plot = TRUE, 
+                            rug = FALSE,  # Removed rug plot
+                            plot.engine = "ggplot2")
+    
+    # Determine appropriate scale for x-axis
+    if (grepl("Income|Value", variable_descriptions[feature])) {
+      x_scale <- scale_x_continuous(labels = scales::dollar_format(scale = 1/1000, suffix = "K"))
+    } else if (grepl("%", variable_descriptions[feature])) {
+      x_scale <- scale_x_continuous(labels = scales::percent_format(scale = 1))
+    } else {
+      x_scale <- scale_x_continuous(labels = scales::comma_format())
+    }
+    
+    # Customize the plot
+    p <- partial_plot +
+      theme_minimal() +
+      labs(
+        x = variable_descriptions[feature],
+        y = NULL  # Removed y-axis label
+      ) +
+      x_scale +
+      theme(
+        axis.title.x = element_text(size = 8),
+        axis.text = element_text(size = 7),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.border = element_blank(),
+        plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm")  # Reduced plot margins
+      )
+    
+    pdp_plots[[feature]] <- p
+  }, error = function(e) {
+    cat("Error creating plot for", feature, ":", conditionMessage(e), "\n")
+  })
+}
+
+# Check if any plots were created
+if (length(pdp_plots) > 0) {
+  # Arrange PDPs in a grid
+  grid_plot <- gridExtra::grid.arrange(
+    grobs = pdp_plots, 
+    ncol = 3,  # Changed to 3 columns for a more compact layout
+    top = "Partial Dependence Plots for Top 10 Features"
+  )
+
+  # Save the plot as a high-resolution image
+  ggsave("pdp_plots_concise.png", grid_plot, width = 12, height = 10, dpi = 300)
+
+  # Print some information about the plot
+  cat("Concise Partial Dependence Plots have been created for the following features:\n")
+  for (feature in names(pdp_plots)) {
+    cat("- ", variable_descriptions[feature], "\n")
+  }
+  cat("\nThe plots have been saved as 'pdp_plots_concise.png' in the current directory.\n")
+} else {
+  cat("No plots were created. Please check the error messages above.\n")
+}
+```
+
+
+
+## SVM
+```{r}
+# Load necessary libraries
+library(e1071)
+library(caret)
+library(dplyr)
+
+# Prepare the data
+set.seed(1234)
+
+model_data <- merged_data_state[, c("winning_party", dictionary$column_name)]
+
+model_data_scaled <- model_data %>%
+  mutate(across(where(is.numeric), scale)) %>%
+  mutate(winning_party = as.factor(winning_party))
+
+# Define the control using leave-one-out cross-validation (LOOCV)
+train_control <- trainControl(method = "LOOCV", savePredictions = TRUE, classProbs = TRUE)
+
+# Set C parameter to 0.1
+tune_grid <- expand.grid(C = 0.1)
+# Fit the SVM model using the cross-validation
+svm_model <- train(winning_party ~ ., data = model_data_scaled, method = "svmLinear", trControl = train_control, tuneGrid = tune_grid)
+
+# Extract the predictions and observed values from the cross-validation
+predictions <- svm_model$pred$pred
+observed <- svm_model$pred$obs
+
+# Confusion matrix
+conf_matrix <- confusionMatrix(predictions, observed)
+print(conf_matrix)
+
+# Calculate accuracy, precision, recall, and F1 score
+accuracy <- conf_matrix$overall['Accuracy']
+precision <- conf_matrix$byClass['Pos Pred Value']
+recall <- conf_matrix$byClass['Sensitivity']
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+cat("Accuracy: ", accuracy, "\n")
+cat("Precision: ", precision, "\n")
+cat("Recall: ", recall, "\n")
+cat("F1 Score: ", f1_score, "\n")
+
+# Plot ROC Curve
+roc_obj <- roc(observed, as.numeric(predictions == "Republican"))
+plot(roc_obj)
+auc_value <- auc(roc_obj)
+cat("AUC: ", auc_value, "\n")
+
+# Extract feature importance for SVM using varImp
+feature_importance <- varImp(svm_model)
+
+# Extract top 10 feature importance
+top_features <- feature_importance$importance %>%
+  rownames_to_column(var = "Feature") %>%
+  arrange(desc(Importance)) %>%
+  head(10)
+# Print feature importance
+print(feature_importance)
+
+# Plot feature importance
+plot(top_features, main = "Feature Importance from SVM Model")
+
+
+```
+
+```{r}
+# Load necessary libraries
+library(e1071)
+library(caret)
+library(dplyr)
+library(pROC)
+
+# Prepare the data
+set.seed(1234)
+model_data <- merged_data_state[, c("winning_party", dictionary$column_name)]
+model_data_scaled <- model_data %>%
+  mutate(across(where(is.numeric), scale)) %>%
+  mutate(winning_party = as.factor(winning_party))
+
+# Define the control using leave-one-out cross-validation (LOOCV)
+train_control <- trainControl(method = "CV", number = 10,
+                              savePredictions = TRUE, 
+                              classProbs = TRUE,
+                              summaryFunction = twoClassSummary)
+
+# Define separate grids for different kernel types
+linear_grid <- expand.grid(C = c(0.1, 1, 10, 100))
+radial_grid <- expand.grid(sigma = c(0.01, 0.1, 1),
+                           C = c(0.1, 1, 10, 100))
+poly_grid <- expand.grid(degree = c(2, 3),
+                         scale = c(0.1, 1),
+                         C = c(0.1, 1, 10, 100))
+
+# Fit SVM models with different kernels
+svm_linear <- train(winning_party ~ ., 
+                    data = model_data_scaled, 
+                    method = "svmLinear", 
+                    trControl = train_control,
+                    tuneGrid = linear_grid,
+                    metric = "ROC")
+
+svm_radial <- train(winning_party ~ ., 
+                    data = model_data_scaled, 
+                    method = "svmRadial", 
+                    trControl = train_control,
+                    tuneGrid = radial_grid,
+                    metric = "ROC")
+
+svm_poly <- train(winning_party ~ ., 
+                  data = model_data_scaled, 
+                  method = "svmPoly", 
+                  trControl = train_control,
+                  tuneGrid = poly_grid,
+                  metric = "ROC")
+
+# Function to calculate performance metrics
+calculate_metrics <- function(model, data) {
+  predictions <- predict(model, newdata = data)
+  cm <- confusionMatrix(predictions, data$winning_party)
+  roc_obj <- roc(data$winning_party, as.numeric(predictions == "Republican"))
+  list(
+    ROC = auc(roc_obj),
+    Accuracy = cm$overall["Accuracy"],
+    Kappa = cm$overall["Kappa"]
+  )
+}
+
+# Compare models
+models_list <- list(Linear = svm_linear, Radial = svm_radial, Polynomial = svm_poly)
+
+# Create a comparison table
+comparison_table <- data.frame(
+  Model = names(models_list),
+  t(sapply(models_list, function(x) calculate_metrics(x, model_data_scaled)))
+)
+
+print(comparison_table)
+
+# Select the best model based on ROC
+best_model <- models_list[[which.max(comparison_table$ROC)]]
+
+# Print the best model
+print(best_model)
+print(best_model$bestTune)
+
+# Extract the predictions and observed values from the best model
+predictions <- predict(best_model, newdata = model_data_scaled)
+observed <- model_data_scaled$winning_party
+
+# Confusion matrix
+conf_matrix <- confusionMatrix(predictions, observed)
+print(conf_matrix)
+
+# Calculate accuracy, precision, recall, and F1 score
+accuracy <- conf_matrix$overall['Accuracy']
+precision <- conf_matrix$byClass['Pos Pred Value']
+recall <- conf_matrix$byClass['Sensitivity']
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+cat("Accuracy: ", accuracy, "\n")
+cat("Precision: ", precision, "\n")
+cat("Recall: ", recall, "\n")
+cat("F1 Score: ", f1_score, "\n")
+
+
+# Extract the support vectors and their coefficients
+sv <- best_model$finalModel@SVindex
+coef <- best_model$finalModel@coef[[1]]
+
+# Get the support vectors
+X <- model_data_scaled[sv, !(names(model_data_scaled) %in% c("winning_party"))]
+
+# Calculate the weights
+w <- t(coef) %*% as.matrix(X)
+
+# Create a data frame of feature importance
+feature_importance <- data.frame(
+  feature = colnames(X),
+  importance = abs(w[1,])
+)
+
+# Sort by importance
+feature_importance <- feature_importance[order(-feature_importance$importance),]
+
+# Print the top 10 most important features
+print(head(feature_importance, 10))
+
+# Plot feature importance
+library(ggplot2)
+ggplot(head(feature_importance, 20), aes(x = reorder(feature, importance), y = importance)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(x = "Features", y = "Importance", title = "Top 20 Most Important Features (Linear SVM)")
+```
+
+```{r}
+# Load necessary libraries
+library(e1071)
+library(caret)
+library(dplyr)
+library(pROC)
+
+# Prepare the data
+set.seed(1234)
+model_data <- merged_data_state[, c("winning_party", dictionary$column_name)]
+model_data_scaled <- model_data %>%
+  mutate(across(where(is.numeric), scale)) %>%
+  mutate(winning_party = as.factor(winning_party))
+
+# Define the control using leave-one-out cross-validation (LOOCV)
+train_control <- trainControl(method = "LOOCV", savePredictions = TRUE, classProbs = TRUE)
+
+# Define the grid of hyperparameters to search over
+svm_grid_linear <- expand.grid(C = c(0.1, 1, 10, 100))
+svm_grid_radial <- expand.grid(sigma = c(0.01, 0.1, 1),
+                           C = c(0.1, 1, 10, 100))
+svm_grid_poly <- expand.grid(degree = c(2, 3),
+                         scale = c(0.1, 1),
+                         C = c(0.1, 1, 10, 100))
+
+# Define the list of SVM models with different kernels
+svm_models <- list(
+  linear = list(method = "svmLinear", tuneGrid = svm_grid_linear),
+  radial = list(method = "svmRadial", tuneGrid = svm_grid_radial),
+  polynomial = list(method = "svmPoly", tuneGrid = svm_grid_poly)
+)
+
+# Initialize variables to store the best model and results
+best_model <- NULL
+best_accuracy <- 0
+best_kernel <- ""
+
+# Train and evaluate each SVM model
+for (kernel in names(svm_models)) {
+  cat("Training SVM with", kernel, "kernel...\n")
+  
+  # Fit the SVM model using cross-validation
+  svm_model <- train(
+    winning_party ~ .,
+    data = model_data_scaled,
+    method = svm_models[[kernel]]$method,
+    tuneGrid = svm_models[[kernel]]$tuneGrid,
+    trControl = train_control
+  )
+  
+  # Extract the predictions and observed values from the cross-validation
+  predictions <- svm_model$pred$pred
+  observed <- svm_model$pred$obs
+  
+  # Confusion matrix
+  conf_matrix <- confusionMatrix(predictions, observed)
+  
+  # Calculate accuracy
+  accuracy <- conf_matrix$overall['Accuracy']
+  
+  # Check if this model has the best accuracy
+  if (accuracy > best_accuracy) {
+    best_model <- svm_model
+    best_accuracy <- accuracy
+    best_kernel <- kernel
+  }
+  
+  cat("Accuracy for", kernel, "kernel: ", accuracy, "\n\n")
+}
+
+# Output the best model and its performance
+cat("Best SVM model used", best_kernel, "kernel with accuracy:", best_accuracy, "\n")
+
+# Confusion matrix for the best model
+best_predictions <- best_model$pred$pred
+best_observed <- best_model$pred$obs
+best_conf_matrix <- confusionMatrix(best_predictions, best_observed)
+print(best_conf_matrix)
+
+# Calculate precision, recall, and F1 score for the best model
+best_precision <- best_conf_matrix$byClass['Pos Pred Value']
+best_recall <- best_conf_matrix$byClass['Sensitivity']
+best_f1_score <- 2 * (best_precision * best_recall) / (best_precision + best_recall)
+
+cat("Precision: ", best_precision, "\n")
+cat("Recall: ", best_recall, "\n")
+cat("F1 Score: ", best_f1_score, "\n")
+
+# Plot ROC Curve for the best model
+best_roc_obj <- roc(best_observed, as.numeric(best_predictions == "Republican"))
+plot(best_roc_obj)
+best_auc_value <- auc(best_roc_obj)
+cat("AUC: ", best_auc_value, "\n")
+
+```
+
+```{r}
+# Load necessary libraries
+library(e1071)
+library(caret)
+library(dplyr)
+
+# Prepare the data
+set.seed(1234)
+model_data <- merged_data_state[, c("winning_party", dictionary$column_name)]
+model_data_scaled <- model_data %>%
+  mutate(across(where(is.numeric), scale)) %>%
+  mutate(winning_party = as.factor(winning_party))
+
+# Define the control using cross-validation
+train_control <- trainControl(method = "cv", number = 10, savePredictions = TRUE, classProbs = TRUE)
+
+# Define the parameter grid for tuning
+tune_grid <- expand.grid(C = 2^(-5:2), sigma = 2^(-15:2))
+
+# Fit the SVM model with radial basis function kernel using the parameter grid
+svm_rbf_model <- train(winning_party ~ ., data = model_data_scaled, 
+                       method = "svmRadial",
+                       trControl = train_control,
+                       tuneGrid = tune_grid)
+
+# Print the best model and its accuracy
+best_model <- svm_rbf_model$bestTune
+best_accuracy <- max(svm_rbf_model$results$Accuracy)
+cat("Best SVM model used RBF kernel with C =", best_model$C, "and sigma =", best_model$sigma, 
+    "with accuracy:", best_accuracy, "\n")
+
+# Confusion matrix for the best model
+best_predictions <- predict(svm_rbf_model, newdata = model_data_scaled)
+conf_matrix <- confusionMatrix(best_predictions, model_data_scaled$winning_party)
+print(conf_matrix)
+
+# Calculate precision, recall, and F1 score for the best model
+precision <- conf_matrix$byClass['Pos Pred Value']
+recall <- conf_matrix$byClass['Sensitivity']
+f1_score <- 2 * (precision * recall) / (precision + recall)
+cat("Precision: ", precision, "\n")
+cat("Recall: ", recall, "\n")
+cat("F1 Score: ", f1_score, "\n")
+
+# Plot ROC Curve for the best model
+library(pROC)
+roc_obj <- roc(model_data_scaled$winning_party, as.numeric(best_predictions == "Republican"))
+plot(roc_obj)
+auc_value <- auc(roc_obj)
+cat("AUC: ", auc_value, "\n")
+
+```
+
+## Hierarchical Clustering
+```{r}
+library(tidyverse)
+library(cluster)
+library(factoextra)
+# 1. Prepare the data
+cluster_data <- merged_data_state[, dictionary$column_name]
+
+# 2. Standardize the data
+scaled_data <- scale(cluster_data)
+
+# Calculate the distance matrix
+dist_matrix <- dist(scaled_data, method = "manhattan")
+
+# Perform hierarchical clustering
+hc <- hclust(dist_matrix, method = "ward.D2")
+
+# Cut the dendrogram into 5 clusters
+clusters <- cutree(hc, k = 3)
+
+# Create a color vector for the clusters
+cluster_colors <- c("#2E9FDF", "#00AFBB", "#E7B800")[clusters]
+
+# Plot the dendrogram
+png("dendrogram_with_states.png", width = 1500, height = 1000, res = 120)  # Increased size and resolution
+par(mar = c(5, 4, 4, 10))  # Adjusted margins to make more room for labels
+
+# Plot the dendrogram
+plot(hc, labels = FALSE, main = "Hierarchical Clustering of US States", 
+     xlab = "", sub = "", hang = -1, cex = 0.8)
+
+# Add rectangles for clusters
+rect.hclust(hc, k = 3, border = c("#2E9FDF", "#00AFBB", "#E7B800"))
+
+# Add state names as labels
+state_order <- merged_data_state$state[hc$order]
+text(x = 1:length(state_order), y = -1, labels = state_order, 
+     srt = 90, adj = 1, xpd = TRUE, cex = 0.7)
+
+
+# Print cluster assignments
+cluster_assignments <- data.frame(
+  State = merged_data_state$state,
+  Cluster = clusters,
+  VotingPreference = merged_data_state$winning_party
+)
+
+# Print the updated cluster assignments
+print(cluster_assignments)
+
+cluster_voting_summary <- cluster_assignments %>%
+  group_by(Cluster) %>%
+  summarize(
+    TotalStates = n(),
+    RepublicanStates = sum(VotingPreference == "Republican"),
+    DemocraticStates = sum(VotingPreference == "Democratic"),
+    PercentRepublican = RepublicanStates / TotalStates * 100,
+    PercentDemocratic = DemocraticStates / TotalStates * 100
+  )
+
+print(cluster_voting_summary)
+```
+
+```{r}
+cluster_profiles <- merged_data_state %>%
+  mutate(Cluster = clusters) %>%
+  group_by(Cluster) %>%
+  summarise(across(dictionary$column_name, mean, na.rm = TRUE))
+
+print(cluster_profiles)
+
+cluster_voting <- cluster_assignments %>%
+  group_by(Cluster) %>%
+  summarise(
+    RepublicanPct = mean(VotingPreference == "Republican") * 100,
+    DemocraticPct = mean(VotingPreference == "Democratic") * 100
+  )
+
+cluster_summary <- left_join(cluster_profiles, cluster_voting, by = "Cluster")
+print(cluster_summary)
+
+library(tidyr)
+
+long_summary <- cluster_summary %>%
+  pivot_longer(cols = -c(Cluster, RepublicanPct, DemocraticPct), 
+               names_to = "Indicator", values_to = "Value")
+
+ggplot(long_summary, aes(x = Indicator, y = Value, fill = factor(Cluster))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~Indicator, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Socio-Economic Indicators by Cluster", x = "", y = "Value")
+
+ggsave("cluster_indicators.png", width = 20, height = 15)
+
+voting_cluster_test <- chisq.test(table(cluster_assignments$Cluster, cluster_assignments$VotingPreference))
+print(voting_cluster_test)
+```
+

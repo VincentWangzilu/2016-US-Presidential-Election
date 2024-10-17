@@ -1,0 +1,1497 @@
+---
+title: "Model Building"
+author: 
+  name: Zilu Wang
+  affiliation: University of Glasgow
+number-sections: true
+format: 
+  html:
+    embed-resources: true
+    code-tools: true
+  pdf: 
+    documentclass: article
+    fontsize: 11pt
+    geometry: margin=1in
+    linestretch: 1.5
+    keep-tex: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-caption: true
+editor_options: 
+  chunk_output_type: console
+execute:
+  echo: false
+  eval: true
+  warning: false
+  message: false
+---
+
+# Model Building
+
+## Generalized Linear Model
+
+### Data Pre-processing
+
+```{r}
+## Read datasets
+PresElect2016R <- read_csv("PresElect2016R copy.csv")
+UScounty_facts <- read_csv("UScounty-facts.csv", locale = locale(encoding = "ISO-8859-1"))
+dictionary <- read_csv("UScounty-dictionary.csv")
+```
+In order to predict the winning party for each state for the 2016 presidential election, there are generally 2 ways. 
+
+The first one is straight forward. Use state level data (51 rows) and build binary classification models to predict the winning party.The downside of this approach is small sample size, only 51 observations, which may lead to overfitting. We are losing a lot of information by aggregating the data at the state level.
+
+The second approach is to use county level data (3141 rows) and build a regression model to predict the Republican vote share. We can then use the predicted vote share and the population of each county to determine the winning party for each state. This approach has the advantage of using more data, but it is more complex as it involves predicting a continuous variable and then converting it to a binary outcome.
+
+We will try both methods and compare the results.
+```{r}
+# Rename columns in PresElect2016R
+votes_by_county <- PresElect2016R |>
+  rename(
+    state = state,
+    state.po = state.po,
+    county = county,
+    fips = FIPS,
+    votesR = candidatevotesR,
+    votesD = candidatevotesD, 
+    fracR = fracvotesR
+  )
+
+#Add columns fracD, totalvotes, winning_party to the votes_by_county dataframe.
+votes_by_county <- votes_by_county |>
+  mutate(
+    fracD = votesD / totalvotes,
+    frac_diff = abs(fracR - fracD),
+    totalvotes = votesR + votesD,
+    winning_party = ifelse(fracR > fracD, "Republican", "Democratic")
+  )
+
+votes_by_state <- votes_by_county %>%
+  group_by(state, state.po) %>%
+  summarise(
+    totalvotes = sum(totalvotes, na.rm = TRUE),
+    votesR = sum(votesR, na.rm = TRUE),
+    votesD = sum(votesD, na.rm = TRUE),
+    fracR = votesR / totalvotes,
+    fracD = votesD / totalvotes,
+    frac_diff = abs(fracR - fracD), 
+    partywonR = ifelse(votesR > votesD, 1, 0),
+    winning_party = if_else(fracR > fracD, "Republican", "Democratic")
+  )
+
+state_facts <- UScounty_facts |>
+  filter(is.na(state_abbreviation)) |>
+  rename(state = area_name) |>
+  dplyr::select(-state_abbreviation, -fips)
+
+county_facts <- UScounty_facts |>
+  filter(!is.na(state_abbreviation)) |>
+  rename(county = area_name)
+
+state_facts$state <- ifelse(state_facts$state == "District Of Columbia", "District of Columbia", state_facts$state)
+merged_data_state <- merge(votes_by_state, state_facts, by = "state")
+merged_data_state <- merge(merged_data_state, state_info, by = "state") |>
+  dplyr::select(-region)
+merged_data_state$winning_party <- as.factor(merged_data_state$winning_party)
+
+# Merge votes_by_county with county_facts by fips
+merged_data_county <- left_join(votes_by_county, county_facts, by = "fips") 
+merged_data_county <- merged_data_county |>
+  filter(complete.cases(county.y)) |>
+  dplyr::select(-county.y, -state_abbreviation) |>
+  rename(county = county.x)
+merged_data_county$winning_party <- as.factor(merged_data_county$winning_party)
+
+# merge merged_data_county with state_info by state
+merged_data_county <- merge(merged_data_county, state_info, by = "state") |>
+  dplyr::select(-region)
+
+```
+
+
+
+```{r}
+# import library for concat
+# Select columns
+model_data <- merged_data_county[, c("winning_party", dictionary$column_name)]
+model_data_scaled <- model_data %>%
+  mutate(across(where(is.numeric), scale))
+```
+
+### PCA
+```{r}
+# PCA
+model_data <- merged_data_county[, c("winning_party", dictionary$column_name)]
+model_data_scaled <- model_data %>%
+  mutate(across(where(is.numeric), scale))
+model_data_X_scaled <- model_data_scaled[, dictionary$column_name]
+pca <- prcomp(model_data_X_scaled, center = TRUE, scale. = FALSE)
+summary(pca)
+# Produce scree plot
+fviz_eig(pca, addlabels = TRUE)
+# produce biplot
+fviz_pca_biplot(pca, label = "var", col.var = "black", repel = TRUE)
+```
+
+
+### Fit GLM with PCs
+```{r}
+# Select the the scores of the first n principal components
+scores <- pca$x[, 1:8]
+
+# scale all principal component scores
+scores <- scale(scores)
+
+# Add response variable and division to the scores
+model_data_pc <- merge(scores, model_data$winning_party, by = 0) |>
+  select(-Row.names) |>
+  rename(winning_party = y)
+
+model_data_pc$winning_party <- as.factor(model_data_pc$winning_party)
+
+# Split train and test data
+set.seed(1234)
+train_index <- sample(1:nrow(model_data_pc), 0.7 * nrow(model_data_pc))
+train_data <- model_data_pc[train_index, ]
+test_data <- model_data_pc[-train_index, ]
+
+
+# Calculate weights
+class_weights <- ifelse(train_data$winning_party == "Republican", 
+                        (1/table(model_data$winning_party)["Republican"]) * 0.5, 
+                        (1/table(model_data$winning_party)["Democratic"]) * 0.5)
+
+# Fit the model using the cross-validation
+model_glm <- glm(winning_party ~ ., data = train_data, family = binomial, weights = class_weights)
+
+summary(model_glm)
+
+# Predict probability
+predictions <- predict(model_glm, test_data, type = "response")
+predictions <- ifelse(predictions > 0.5, "Republican", "Democratic")
+predictions <- as.factor(predictions)
+observed <- test_data$winning_party
+
+# Confusion matrix
+conf_matrix <- confusionMatrix(predictions, observed)
+print(conf_matrix)
+
+# Calculate accuracy, precision, recall, and F1 score
+accuracy <- conf_matrix$overall['Accuracy']
+precision <- conf_matrix$byClass['Pos Pred Value']
+recall <- conf_matrix$byClass['Sensitivity']
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+cat("Accuracy: ", accuracy, "\n")
+cat("Precision: ", precision, "\n")
+cat("Recall: ", recall, "\n")
+cat("F1 Score: ", f1_score, "\n")
+
+# Plot ROC Curve
+roc_obj <- roc(observed, as.numeric(predictions))
+plot(roc_obj)
+auc_value <- auc(roc_obj)
+cat("AUC: ", auc_value, "\n")
+
+
+```
+
+
+### Feature Selection
+
+```{r}
+fviz_pca_biplot(pca, label = "var", col.var = "black", repel = TRUE)
+```
+
+From the Biplot we see that population (2010, 2014) is highly correlated with housing number, sales (manufacture, whosale, retail), and number of firms. 
+
+Then we see vairiables describing housing, income, education, and racial diversity are closely related.
+
+The variables are roughly separated into 5 groups, I will pick the most representative variable from each group to include in the logistic regression model.
+
+POP645213 (Immigration), EDU685213 (Education), PST045214 (Population), HSG495213 (Housing), RHI825214 (White population)
+
+### Correlation Heatmap
+```{r}
+library(ggcorrplot)
+# Specify the indicators to use in the model
+indicators <- c("POP645213", "EDU685213", "PST045214", "HSG495213", "RHI825214")
+
+
+# Compute the correlation matrix
+cor_matrix <- cor(model_data_X[, indicators], use = "complete.obs")
+
+# Define the custom colorscale
+custom_colorscale <- c("blue", "white", "red")
+
+# Create the heatmap
+heatmap_plot <- ggcorrplot(cor_matrix, 
+                           lab = TRUE, 
+                           colors = custom_colorscale, 
+                           outline.color = "black")
+
+# Show the plot
+print(heatmap_plot)
+```
+
+## GLM with Selected Features
+```{r}
+set.seed(1234)
+# Load necessary libraries
+library(caret)
+library(ggplot2)
+
+feature_set <- c("AGE775214", "HSG495213", "RHI425214", "HSD310213", "PVY020213")
+indicators <- c("POP645213", "EDU685213", "PST045214", "HSG495213", "RHI825214")
+
+# Assume merged_data_county is your dataframe and fracR is your target variable
+model_data <- merged_data_county[, c("votesR", "votesD", "fracR", indicators)]
+model_data_scaled <- model_data %>%
+  mutate(across(indicators, scale))
+
+# Split the data into training and testing sets
+train_index <- sample(1:nrow(model_data_scaled), 0.7 * nrow(model_data_scaled))
+train_data <- model_data_scaled[train_index, ]
+test_data <- model_data_scaled[-train_index, ]
+
+# Fit the generalized linear model with a logit link function
+# glm_model <- glm(fracR ~ ., data = train_data, family = binomial(link = "logit"))
+glm_model <- glm(cbind(votesR, votesD) ~ .-fracR, 
+             family = binomial(link = "logit"), data = train_data)
+
+
+
+# Print the model summary
+summary(glm_model)
+
+# Predict on the test set
+predictions <- predict(glm_model, newdata = test_data, type = "response")
+
+# Evaluate the model performance
+mse <- mean((test_data$fracR - predictions)^2)
+rmse <- sqrt(mse)
+r2 <- cor(test_data$fracR, predictions)^2
+cat("Mean Squared Error: ", mse, "\n")
+cat("Root Mean Squared Error: ", rmse, "\n")
+cat("R-squared: ", r2, "\n")
+# Plot the predicted vs actual values
+plot(test_data$fracR, predictions, main = "Predicted vs Actual",
+     xlab = "Actual Values", ylab = "Predicted Values", pch = 19)
+abline(0, 1, col = "red")
+
+```
+
+## Beta Regression Model
+```{r}
+library(betareg)
+# define dataset
+feature_set7 <- c("RHI825214", "HSG495213", "AGE295214", "EDU685213", "PST045214")
+model_data <- merged_data_county[, c("fracR", dictionary$column_name)]
+model_data_scaled <- model_data %>%
+  mutate(across(-fracR, scale))
+# split train and test data
+set.seed(1234)
+train_index <- sample(1:nrow(model_data_scaled), 0.7 * nrow(model_data_scaled))
+train_data <- model_data_scaled[train_index, ]
+test_data <- model_data_scaled[-train_index, ]
+# train the beta regression model
+model_beta <- betareg(fracR ~ ., data = train_data)
+# predict
+predictions <- predict(model_beta, test_data)
+# evaluate the model performance
+mse <- mean((test_data$fracR - predictions)^2)
+rmse <- sqrt(mse)
+r2 <- cor(test_data$fracR, predictions)^2
+cat("Mean Squared Error: ", mse, "\n")
+cat("Root Mean Squared Error: ", rmse, "\n")
+cat("R-squared: ", r2, "\n")
+# plot the predicted vs actual values
+plot(test_data$fracR, predictions, main = "Predicted vs Actual",
+     xlab = "Actual Values", ylab = "Predicted Values", pch = 19)
+abline(0, 1, col = "red")
+
+# calculate VIF values
+vif(model_beta)
+summary(model_beta)
+```
+
+
+```{r}
+feature_sets <- list(
+  feature_set1 = c("RHI825214", "HSG495213", "AGE775214"),
+  feature_set2 = c("AGE295214", "EDU685213", "RHI825214"),
+  feature_set3 = c("POP060210", "EDU685213", "RHI425214"),
+  feature_set4 = c("PST045214", "LFE305213", "HSG445213"),
+  feature_set5 = c("POP060210", "AGE295214", "RHI825214", "HSG495213"),
+  feature_set6 = c("INC110213", "HSG495213", "AGE775214"),
+  feature_set7 = c("RHI825214", "HSG495213", "AGE295214", "EDU685213", "PST045214"),
+  feature_set_8 = c("HSG495213", "AGE775214", "EDU685213", "RHI825214", "PST045214", "LFE305213", "HSG445213", "POP060210")
+)
+
+# Initialize a list to store the results
+results <- list()
+
+# Set seed for reproducibility
+set.seed(1234)
+
+# Loop over each feature set
+for (i in seq_along(feature_sets)) {
+  # Define dataset with current feature set
+  model_data <- merged_data_county[, c("fracR", feature_sets[[i]])]
+  model_data_scaled <- model_data %>%
+    mutate(across(-fracR, scale))
+  
+  # Split train and test data
+  train_index <- sample(1:nrow(model_data_scaled), 0.7 * nrow(model_data_scaled))
+  train_data <- model_data_scaled[train_index, ]
+  test_data <- model_data_scaled[-train_index, ]
+  
+  # Train the beta regression model
+  model_beta <- betareg(fracR ~ ., data = train_data, link = "logit")
+  
+  # Predict
+  predictions <- predict(model_beta, test_data)
+  
+  # Evaluate the model performance
+  mse <- mean((test_data$fracR - predictions)^2)
+  rmse <- sqrt(mse)
+  r2 <- cor(test_data$fracR, predictions)^2
+  
+  # Store the results
+  results[[i]] <- data.frame(
+    Feature_Set = paste0("Feature_Set_", i),
+    MSE = mse,
+    RMSE = rmse,
+    R_squared = r2
+  )
+}
+
+# Combine the results into a single dataframe
+results_df <- do.call(rbind, results)
+
+# Print the results
+print(results_df)
+
+# Visualize the results
+ggplot(results_df, aes(x = Feature_Set)) +
+  geom_bar(aes(y = RMSE), stat = "identity", fill = "steelblue") +
+  geom_text(aes(y = RMSE, label = round(RMSE, 3)), vjust = -0.3) +
+  labs(title = "Model Performance for Different Feature Sets",
+       x = "Feature Set",
+       y = "Root Mean Squared Error (RMSE)") +
+  theme_minimal()
+```
+
+### Stepwise Selection
+```{r}
+library(betareg)
+library(MASS)
+library(caret)
+
+model_data <- merged_data_county[, c("fracR", dictionary$column_name)]
+model_data_scaled <- model_data %>%
+  mutate(across(-fracR, scale))
+
+# Custom stepwise selection function for beta regression with max features
+stepwise_betareg <- function(data, response, predictors, max_features = 10) {
+  # Start with the null model
+  current_model <- betareg(as.formula(paste(response, "~ 1")), data = data)
+  current_aic <- AIC(current_model)
+  
+  # Initialize variables
+  best_aic <- current_aic
+  best_model <- current_model
+  remaining_predictors <- predictors
+  selected_predictors <- c()
+  
+  repeat {
+    aic_values <- c()
+    
+    # Try adding each remaining predictor
+    for (predictor in remaining_predictors) {
+      formula <- as.formula(paste(response, "~", paste(c(selected_predictors, predictor), collapse = "+")))
+      model <- betareg(formula, data = data)
+      aic_values <- c(aic_values, AIC(model))
+    }
+    
+    # Find the predictor that leads to the best (lowest) AIC
+    best_index <- which.min(aic_values)
+    
+    if (aic_values[best_index] < best_aic && length(selected_predictors) < max_features) {
+      best_aic <- aic_values[best_index]
+      selected_predictors <- c(selected_predictors, remaining_predictors[best_index])
+      remaining_predictors <- remaining_predictors[-best_index]
+      best_model <- betareg(as.formula(paste(response, "~", paste(selected_predictors, collapse = "+"))), data = data)
+    } else {
+      break
+    }
+  }
+  
+  return(best_model)
+}
+
+# Define the response and predictors
+response <- "fracR"
+predictors <- setdiff(names(model_data_scaled), response)
+
+# Train-test split (70-30)
+set.seed(1234)
+trainIndex <- createDataPartition(model_data_scaled[[response]], p = 0.7, list = FALSE)
+train_data <- model_data_scaled[trainIndex, ]
+remaining_data <- model_data_scaled[-trainIndex, ]
+validationIndex <- createDataPartition(remaining_data[[response]], list = FALSE)
+validation_data <- remaining_data[validationIndex, ]
+
+# Perform stepwise selection on the training data with max 10 features
+best_model <- stepwise_betareg(train_data, response, predictors, max_features = 10)
+
+# Summary of the selected model
+summary(best_model)
+
+# Validate the model on the validation set
+validation_predictions <- predict(best_model, newdata = validation_data, type = "response")
+
+# Calculate Mean Squared Error (MSE) on validation set
+validation_mse <- mean((validation_predictions - validation_data$fracR)^2)
+
+# Calculate Mean Absolute Error (MAE) on validation set
+validation_mae <- mean(abs(validation_predictions - validation_data$fracR))
+
+cat("Validation Mean Squared Error:", validation_mse, "\n")
+cat("Validation Mean Absolute Error:", validation_mae, "\n")
+
+# calculate R2
+r2 <- cor(validation_data$fracR, validation_predictions)^2
+cat("R-squared: ", r2, "\n")
+
+# Plot residuals
+plot(residuals(best_model), pch = 19, xlab = "Index", ylab = "Residuals", main = "Residuals Plot")
+abline(h = 0, col = "red")
+
+# Plot prediction vs actual values
+plot(test_data$fracR, test_predictions, pch = 19, xlab = "Actual Values", ylab = "Predicted Values", main = "Predicted vs Actual")
+abline(0, 1, col = "red")
+```
+
+### Stepwise selection 2
+```{r}
+library(betareg)
+library(dplyr)
+
+# Prepare the data
+model_data <- merged_data_county[, c("fracR", dictionary$column_name)]
+model_data_scaled <- model_data %>%
+  mutate(across(-fracR, scale)) %>%
+  filter(fracR > 0 & fracR < 1)  # Ensure fracR is within the valid range for beta regression
+
+# Custom stepwise selection function for beta regression with both forward and backward steps
+custom_stepwise_betareg <- function(data, response, predictors) {
+  # Start with the null model
+  current_formula <- as.formula(paste(response, "~ 1"))
+  best_model <- betareg(current_formula, data = data)
+  best_aic <- AIC(best_model)
+  
+  # Initialize variables
+  remaining_predictors <- predictors
+  selected_predictors <- c()
+  improved <- TRUE
+  
+  while (improved) {
+    improved <- FALSE
+    # Forward step: Try adding each remaining predictor
+    aic_values_add <- sapply(remaining_predictors, function(predictor) {
+      formula_add <- as.formula(paste(response, "~", paste(c(selected_predictors, predictor), collapse = "+")))
+      model_add <- betareg(formula_add, data = data)
+      AIC(model_add)
+    })
+    
+    # Check if adding a predictor improves the model
+    best_add <- which.min(aic_values_add)
+    if (aic_values_add[best_add] < best_aic) {
+      best_aic <- aic_values_add[best_add]
+      selected_predictors <- c(selected_predictors, remaining_predictors[best_add])
+      remaining_predictors <- remaining_predictors[-best_add]
+      improved <- TRUE
+    }
+    
+    # Backward step: Try removing each selected predictor
+    if (length(selected_predictors) > 1) {
+      aic_values_remove <- sapply(selected_predictors, function(predictor) {
+        formula_remove <- as.formula(paste(response, "~", paste(setdiff(selected_predictors, predictor), collapse = "+")))
+        model_remove <- betareg(formula_remove, data = data)
+        AIC(model_remove)
+      })
+      
+      # Check if removing a predictor improves the model
+      best_remove <- which.min(aic_values_remove)
+      if (aic_values_remove[best_remove] < best_aic) {
+        best_aic <- aic_values_remove[best_remove]
+        remaining_predictors <- c(remaining_predictors, selected_predictors[best_remove])
+        selected_predictors <- selected_predictors[-best_remove]
+        improved <- TRUE
+      }
+    }
+  }
+  
+  # Return the final model
+  final_formula <- as.formula(paste(response, "~", paste(selected_predictors, collapse = "+")))
+  final_model <- betareg(final_formula, data = data)
+  
+  return(final_model)
+}
+
+# Define the response and predictors
+response <- "fracR"
+predictors <- setdiff(names(model_data_scaled), response)
+
+# Train-test split (70-30)
+set.seed(1234)
+trainIndex <- createDataPartition(model_data_scaled[[response]], p = 0.7, list = FALSE)
+train_data <- model_data_scaled[trainIndex, ]
+test_data <- model_data_scaled[-trainIndex, ]
+
+# Train the final model using custom stepwise selection
+final_model <- custom_stepwise_betareg(train_data, response, predictors)
+
+# Summary of the final model
+summary(final_model)
+
+# Predict on test set
+test_predictions <- predict(final_model, newdata = test_data, type = "response")
+
+# Calculate RMSE
+calculate_rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+final_rmse <- calculate_rmse(test_data[[response]], test_predictions)
+cat("Final RMSE:", final_rmse, "\n")
+
+# Calculate R-squared
+SST <- sum((test_data$fracR - mean(test_data$fracR))^2)
+SSE <- sum((test_data$fracR - test_predictions)^2)
+R_squared <- 1 - SSE/SST
+cat("R-squared:", R_squared, "\n")
+
+# Print the selected features
+selected_features <- names(coef(final_model))[-1]  # Exclude intercept
+cat("Selected features:\n")
+print(selected_features)
+```
+
+### Beta regression with PC
+```{r}
+# Prepare the data
+model_data <- merged_data_county[, c("fracR", dictionary$column_name)]
+
+# Scale the predictors
+model_data_scaled <- model_data %>%
+  mutate(across(-fracR, scale))
+
+# Define predictors
+predictors <- setdiff(names(model_data_scaled), "fracR")
+
+# Perform PCA on the predictors
+pca_result <- prcomp(model_data_scaled[, predictors], scale. = FALSE, center = TRUE)
+
+# Choose the number of principal components (PCs) to keep
+explained_variance <- summary(pca_result)$importance[2,]
+num_pcs <- which(cumsum(explained_variance) >= 0.8)[1]  # Keep enough PCs to explain 80% variance
+
+# Create a new dataset with the selected PCs
+pca_data <- as.data.frame(pca_result$x[, 1:num_pcs])
+pca_data$fracR <- model_data_scaled$fracR
+
+# Train-test split (70-30)
+set.seed(1234)
+trainIndex <- createDataPartition(pca_data$fracR, p = 0.7, list = FALSE)
+train_data <- pca_data[trainIndex, ]
+test_data <- pca_data[-trainIndex, ]
+
+# Fit a beta regression model using the PCs on the training set
+train_model <- betareg(fracR ~ ., data = train_data)
+
+# Summary of the model
+summary(train_model)
+
+# Predict on the test set
+test_predictions <- predict(train_model, newdata = test_data, type = "response")
+
+# Calculate Mean Squared Error (MSE) on test set
+test_mse <- mean((test_predictions - test_data$fracR)^2)
+
+# Calculate Mean Absolute Error (MAE) on test set
+test_mae <- mean(abs(test_predictions - test_data$fracR))
+
+cat("Test Mean Squared Error:", test_mse, "\n")
+cat("Test Mean Absolute Error:", test_mae, "\n")
+
+# Plot prediction vs actual values for the test set
+plot(test_data$fracR, test_predictions, pch = 19, xlab = "Actual Values", ylab = "Predicted Values", main = "Predicted vs Actual")
+abline(0, 1, col = "red")
+
+# Print R2
+r2 <- cor(test_data$fracR, test_predictions)^2
+cat("R-squared: ", r2, "\n")
+
+# Calculate VIF values
+vif(train_model)
+
+# Extract the rotation (loadings) matrix
+loadings <- pca_result$rotation[, 1:num_pcs]
+# Function to get top N variables for each PC based on loadings
+get_top_variables <- function(loadings, top_n = 5) {
+  apply(loadings, 2, function(pc_loadings) {
+    # Sort the loadings by absolute value and get the top N variables
+    top_vars <- sort(abs(pc_loadings), decreasing = TRUE)[1:top_n]
+    # Return the variable names along with the original loadings
+    top_vars <- names(top_vars)
+    return(top_vars)
+  })
+}
+# Get the top 5 variables for each principal component
+top_variables <- get_top_variables(loadings, top_n = 5)
+
+# Display the results
+for (i in 1:num_pcs) {
+  cat("Top variables for PC", i, ":\n")
+  print(top_variables[[i]])
+  cat("\n")
+}
+```
+
+```{r}
+# Extract the rotation (loadings) matrix
+loadings <- pca_result$rotation[, 1:num_pcs]
+
+# Extract the coefficients of the PCs from the regression model
+pc_coefficients <- coef(train_model)[2:(num_pcs + 1)]
+
+# Calculate the contribution of each original variable
+variable_importance <- abs(loadings %*% pc_coefficients)
+
+# Sort and print the variable importance
+importance_df <- data.frame(Variable = rownames(loadings), Importance = variable_importance)
+importance_df <- importance_df[order(importance_df$Importance, decreasing = TRUE), ]
+print(importance_df)
+```
+
+### Feature Selection VS PC Regression
+```{r}
+# Load necessary libraries
+library(betareg)
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(psych)
+
+# Prepare the data
+model_data <- merged_data_county[, c("fracR", dictionary$column_name)]
+
+# Scale the predictors
+model_data_scaled <- model_data %>%
+  mutate(across(-fracR, scale))
+
+# Define the predictors
+predictors <- setdiff(names(model_data_scaled), "fracR")
+
+# Train-test split (70-30)
+set.seed(123)
+trainIndex <- createDataPartition(model_data_scaled$fracR, p = 0.7, list = FALSE)
+train_data <- model_data_scaled[trainIndex, ]
+test_data <- model_data_scaled[-trainIndex, ]
+
+### 1. Feature Selection Approach ###
+
+# Perform stepwise selection based on AIC
+stepwise_betareg <- function(data, response, predictors) {
+  current_model <- betareg(as.formula(paste(response, "~ 1")), data = data)
+  current_aic <- AIC(current_model)
+  best_aic <- current_aic
+  best_model <- current_model
+  remaining_predictors <- predictors
+  selected_predictors <- c()
+  
+  while (length(remaining_predictors) > 0) {
+    aic_values <- sapply(remaining_predictors, function(predictor) {
+      formula <- as.formula(paste(response, "~", paste(c(selected_predictors, predictor), collapse = "+")))
+      AIC(betareg(formula, data = data))
+    })
+    best_index <- which.min(aic_values)
+    if (aic_values[best_index] < best_aic) {
+      best_aic <- aic_values[best_index]
+      selected_predictors <- c(selected_predictors, remaining_predictors[best_index])
+      remaining_predictors <- remaining_predictors[-best_index]
+      best_model <- betareg(as.formula(paste(response, "~", paste(selected_predictors, collapse = "+"))), data = data)
+    } else {
+      break
+    }
+  }
+  return(best_model)
+}
+
+# Train the model with feature selection
+feature_selection_model <- stepwise_betareg(train_data, "fracR", predictors)
+
+# Summary of the feature selection model
+summary(feature_selection_model)
+
+# Evaluate the feature selection model on the test set
+test_predictions_fs <- predict(feature_selection_model, newdata = test_data, type = "response")
+test_mse_fs <- mean((test_predictions_fs - test_data$fracR)^2)
+test_mae_fs <- mean(abs(test_predictions_fs - test_data$fracR))
+
+cat("Feature Selection Model - Test MSE:", test_mse_fs, "\n")
+cat("Feature Selection Model - Test MAE:", test_mae_fs, "\n")
+
+### 2. PCA Regression Approach ###
+
+# Perform PCA on the predictors
+pca_result <- prcomp(train_data[, predictors], scale. = FALSE, center = TRUE)
+
+# Choose the number of principal components to keep (explaining 80% variance)
+explained_variance <- summary(pca_result)$importance[2,]
+num_pcs <- which(cumsum(explained_variance) >= 0.8)[1]
+
+# Create a new dataset with the selected PCs
+pca_train_data <- as.data.frame(pca_result$x[, 1:num_pcs])
+pca_train_data$fracR <- train_data$fracR
+
+# Fit a beta regression model using the PCs
+pca_model <- betareg(fracR ~ ., data = pca_train_data)
+
+# Summary of the PCA model
+summary(pca_model)
+
+# Evaluate the PCA model on the test set
+pca_test_data <- predict(pca_result, newdata = test_data)[, 1:num_pcs]
+pca_test_data <- as.data.frame(pca_test_data)
+pca_test_data$fracR <- test_data$fracR
+
+test_predictions_pca <- predict(pca_model, newdata = pca_test_data, type = "response")
+test_mse_pca <- mean((test_predictions_pca - pca_test_data$fracR)^2)
+test_mae_pca <- mean(abs(test_predictions_pca - pca_test_data$fracR))
+
+cat("PCA Model - Test MSE:", test_mse_pca, "\n")
+cat("PCA Model - Test MAE:", test_mae_pca, "\n")
+
+# Calculate R-squared for the PCA model
+SST <- sum((pca_test_data$fracR - mean(pca_test_data$fracR))^2)
+SSE <- sum((pca_test_data$fracR - test_predictions_pca)^2)
+R_squared_pca <- 1 - SSE/SST
+cat("PCA Model - R-squared:", R_squared_pca, "\n")
+
+# Plot residuals for PCA model
+plot(residuals(pca_model), pch = 19, xlab = "Index", ylab = "Residuals", main = "PCA Model - Residuals Plot")
+abline(h = 0, col = "red")
+
+# Plot prediction vs actual values for the PCA model
+plot(pca_test_data$fracR, test_predictions_pca, pch = 19, xlab = "Actual Values", ylab = "Predicted Values", main = "PCA Model - Predicted vs Actual")
+abline(0, 1, col = "red")
+
+### Variable Importance Interpretation for PCA Regression ###
+
+# Calculate variable importance based on PCA loadings and regression coefficients
+loadings <- pca_result$rotation[, 1:num_pcs]
+coefficients <- coef(pca_model)[-1]  # Exclude intercept
+
+# Ensure that the number of coefficients matches the number of principal components used
+if (length(coefficients) == num_pcs) {
+  variable_importance <- rowSums(abs(loadings[, 1:num_pcs] %*% diag(coefficients)))
+  
+  # Sort variable importance in descending order
+  variable_importance <- sort(variable_importance, decreasing = TRUE)
+  
+  cat("Top 10 Most Important Variables:\n")
+  print(variable_importance[1:10])
+} else {
+  cat("Error: Number of coefficients does not match the number of principal components.")
+}
+```
+
+### Stepwise Selection
+```{r}
+library(betareg)
+library(car)
+library(dplyr)
+
+# Prepare the data
+model_data <- merged_data_county[, c("fracR", dictionary$column_name)]
+model_data_scaled <- model_data %>%
+  mutate(across(-fracR, scale))
+
+# Custom stepwise selection function for beta regression with VIF check
+stepwise_betareg_vif <- function(data, response, predictors, vif_threshold = 5, max_features = 20) {
+  # Start with the null model
+  current_model <- betareg(as.formula(paste(response, "~ 1")), data = data)
+  current_aic <- AIC(current_model)
+  
+  # Initialize variables
+  best_aic <- current_aic
+  best_model <- current_model
+  remaining_predictors <- predictors
+  selected_predictors <- c()
+  
+  for (i in 1:max_features) {
+    candidate_models <- lapply(remaining_predictors, function(predictor) {
+      formula <- as.formula(paste(response, "~", paste(c(selected_predictors, predictor), collapse = "+")))
+      model <- betareg(formula, data = data)
+      
+      # Check if there are at least 2 predictors for VIF calculation
+      if (length(c(selected_predictors, predictor)) > 1) {
+        # Calculate VIFs for the candidate model
+        vif_values <- vif(model)
+        # Only consider models where all VIF values are below the threshold
+        if (all(vif_values < vif_threshold)) {
+          return(list(model = model, aic = AIC(model), vif_values = vif_values))
+        } else {
+          return(NULL)
+        }
+      } else {
+        # If there's only one predictor, return the model without VIF check
+        return(list(model = model, aic = AIC(model)))
+      }
+    })
+    
+    # Filter out any null models (those that didn't meet the VIF threshold)
+    candidate_models <- candidate_models[!sapply(candidate_models, is.null)]
+    
+    # If no valid models are left, break the loop
+    if (length(candidate_models) == 0) break
+    
+    # Select the model with the lowest AIC
+    best_candidate <- candidate_models[[which.min(sapply(candidate_models, function(x) x$aic))]]
+    
+    if (best_candidate$aic < best_aic) {
+      best_aic <- best_candidate$aic
+      best_model <- best_candidate$model
+      selected_predictors <- c(selected_predictors, remaining_predictors[which.min(sapply(candidate_models, function(x) x$aic))])
+      remaining_predictors <- setdiff(remaining_predictors, selected_predictors)
+    } else {
+      break
+    }
+  }
+  
+  return(best_model)
+}
+
+# Define the response and predictors
+response <- "fracR"
+predictors <- setdiff(names(model_data_scaled), response)
+
+# Train-test split (70-30)
+set.seed(1234)
+trainIndex <- createDataPartition(model_data_scaled[[response]], p = 0.7, list = FALSE)
+train_data <- model_data_scaled[trainIndex, ]
+test_data <- model_data_scaled[-trainIndex, ]
+
+# Run stepwise selection with VIF constraint
+final_model <- stepwise_betareg_vif(train_data, response, predictors, vif_threshold = 5, max_features = 20)
+
+# Summary of the final model
+summary(final_model)
+
+# Predict on the test set
+test_predictions <- predict(final_model, newdata = test_data, type = "response")
+
+# Calculate performance metrics
+test_mse <- mean((test_predictions - test_data$fracR)^2)
+test_mae <- mean(abs(test_predictions - test_data$fracR))
+r2 <- cor(test_data$fracR, test_predictions)^2
+
+cat("Test Mean Squared Error:", test_mse, "\n")
+cat("Test Mean Absolute Error:", test_mae, "\n")
+cat("R-squared:", r2, "\n")
+
+# Calculate VIF values for the final model
+final_vif <- vif(final_model)
+cat("VIF values:\n")
+print(final_vif)
+```
+
+### PCA regression conclusion
+```{r}
+# Get the loadings
+loadings <- pca_result$rotation[, 1:10]  # We're using 10 PCs in our model
+
+# Print the loadings for the first few PCs
+print(loadings[, 1:5])
+
+# Get the top contributing variables for each PC
+top_contributors <- function(loadings, n = 5) {
+  top <- apply(loadings, 2, function(x) order(abs(x), decreasing = TRUE)[1:n])
+  return(top)
+}
+
+top_vars <- top_contributors(loadings)
+print(top_vars)
+
+# Calculate total effect of each original variable
+beta_coefficients <- coef(train_model)[2:11]  # Exclude intercept
+total_effects <- loadings %*% beta_coefficients
+print(sort(total_effects, decreasing = TRUE))
+```
+Based on the provided results, I'll interpret the principal components (PCs) and their relationship with the original variables:
+
+PC1 (largest negative coefficient in the model):
+The top contributing variables to PC1 are:
+
+HSD410213 (Households, 2009-2013)
+HSG010214 (Housing units, 2014)
+PST045214 (Population, 2014 estimate)
+RTN130207 (Retail sales, 2007)
+BZA010213 (Private nonfarm establishments, 2013)
+
+PC1 seems to be capturing overall population and economic activity. The negative coefficient in the model suggests that counties with larger populations and more economic activity tend to have lower Republican vote shares.
+PC2:
+Top contributors include:
+
+RHI825214 (White alone, not Hispanic or Latino, percent, 2014)
+EDU635213 (High school graduate or higher, percent of persons age 25+, 2009-2013)
+PVY020213 (Persons below poverty level, percent, 2009-2013)
+HSD310213 (Persons per household, 2009-2013)
+AGE135214 (Persons under 5 years, percent, 2014)
+
+PC2 appears to be capturing demographic composition and education levels. The negative coefficient suggests that counties with higher white populations and education levels tend to have lower Republican vote shares.
+PC4 (largest positive coefficient in the model):
+Top contributors are:
+
+RHI225214 (Black or African American alone, percent, 2014)
+RHI125214 (White alone, percent, 2014)
+SBO315207 (Black-owned firms, percent, 2007)
+RHI725214 (Hispanic or Latino, percent, 2014)
+POP815213 (Language other than English spoken at home, pct age 5+, 2009-2013)
+
+PC4 seems to be capturing racial and ethnic diversity. The positive coefficient suggests that counties with higher diversity tend to have higher Republican vote shares, which is somewhat counterintuitive and may require further investigation.
+
+Looking at the total effects:
+The variables with the largest positive total effects (associated with higher Republican vote shares) include:
+
+Population estimates
+Retail sales
+Manufacturing shipments
+Merchant wholesaler sales
+Private nonfarm establishments
+
+The variables with the largest negative total effects (associated with lower Republican vote shares) include:
+
+Persons below poverty level
+Black or African American alone percent
+Language other than English spoken at home
+Foreign-born persons percent
+Bachelor's degree or higher percent
+
+These results suggest that counties with higher economic activity tend to have higher Republican vote shares, while counties with higher poverty rates, more diverse populations, and higher education levels tend to have lower Republican vote shares. However, the relationship between racial diversity and voting patterns seems complex and may require more nuanced interpretation.
+Remember that these interpretations are based on aggregate data and may not reflect individual voting behaviors. Additionally, the relationships captured by PCA can be complex and may not always align with intuitive expectations.
+
+## Fractional Logistic Regression
+```{r}
+# Load necessary libraries
+library(caret)
+library(betareg)
+library(dplyr)
+library(ggplot2)
+
+# Define feature sets
+feature_sets <- list(
+  feature_set1 = c("RHI825214", "HSG495213", "AGE775214"),
+  feature_set2 = c("AGE295214", "EDU685213", "RHI825214"),
+  feature_set3 = c("POP060210", "EDU685213", "RHI425214"),
+  feature_set4 = c("PST045214", "LFE305213", "HSG445213"),
+  feature_set5 = c("POP060210", "AGE295214", "RHI825214", "HSG495213"),
+  feature_set6 = c("INC110213", "HSG495213", "AGE775214"),
+  feature_set7 = c("RHI825214", "HSG495213", "AGE295214", "EDU685213", "LFE305213", "PST045214"),
+  feature_set_8 = c("HSG495213", "AGE775214", "EDU685213", "RHI825214", "PST045214", "LFE305213", "HSG445213", "POP060210")
+)
+
+# Initialize a list to store the results
+results <- list()
+
+# Set seed for reproducibility
+set.seed(1234)
+
+# Loop over each feature set
+for (i in seq_along(feature_sets)) {
+  # Define dataset with current feature set
+  model_data <- merged_data_county[, c("fracR", feature_sets[[i]])]
+  model_data_scaled <- model_data %>%
+    mutate(across(-fracR, scale))
+  
+  # Split train and test data
+  train_index <- sample(1:nrow(model_data_scaled), 0.7 * nrow(model_data_scaled))
+  train_data <- model_data_scaled[train_index, ]
+  test_data <- model_data_scaled[-train_index, ]
+  
+  # Train the fractional logistic regression model
+  model_frac_logit <- betareg(fracR ~ ., data = train_data, link = "logit")
+  
+  # Predict
+  predictions <- predict(model_frac_logit, test_data, type = "response")
+  
+  # Evaluate the model performance
+  mse <- mean((test_data$fracR - predictions)^2)
+  rmse <- sqrt(mse)
+  r2 <- cor(test_data$fracR, predictions)^2
+  
+  # Store the results
+  results[[i]] <- data.frame(
+    Feature_Set = paste0("Feature_Set_", i),
+    MSE = mse,
+    RMSE = rmse,
+    R_squared = r2
+  )
+}
+
+# Combine the results into a single dataframe
+results_df <- do.call(rbind, results)
+
+# Print the results
+print(results_df)
+
+# Visualize the results
+ggplot(results_df, aes(x = Feature_Set)) +
+  geom_bar(aes(y = RMSE), stat = "identity", fill = "steelblue") +
+  geom_text(aes(y = RMSE, label = round(RMSE, 3)), vjust = -0.3) +
+  labs(title = "Model Performance for Different Feature Sets",
+       x = "Feature Set",
+       y = "Root Mean Squared Error (RMSE)") +
+  theme_minimal()
+```
+
+
+## GAMs
+```{r}
+library(mgcv)
+set.seed(1234)
+model_data <- merged_data_county[, c("fracR", "RHI825214", "POP645213", "EDU685213", "HSG445213", "HSG096213", "HSG495213", "INC910213")]
+model_data_scaled <- model_data %>%
+  mutate(across(-fracR, scale))
+
+set.seed(1234)
+train_index <- sample(1:nrow(model_data_scaled), 0.7 * nrow(model_data_scaled))
+train_data <- model_data_scaled[train_index, ]
+test_data <- model_data_scaled[-train_index, ]
+
+# Define the formula for the GAM model
+gam_formula <- as.formula(paste("fracR ~", paste("s(", names(model_data_scaled)[-1], ")", collapse = " + ", sep = "")))
+
+# Fit the GAM model
+gam_model <- gam(gam_formula, data = train_data, family = betar)
+
+# Summarize the model
+summary(gam_model)
+
+# Predict on the test set
+predictions <- predict(gam_model, newdata = test_data)
+
+# Evaluate the model performance
+mse <- mean((test_data$fracR - predictions)^2)
+rmse <- sqrt(mse)
+r2 <- cor(test_data$fracR, predictions)^2
+
+cat("Mean Squared Error: ", mse, "\n")
+cat("Root Mean Squared Error: ", rmse, "\n")
+cat("R-squared: ", r2, "\n")
+
+# Plot the predicted vs actual values
+plot(test_data$fracR, predictions, main = "Predicted vs Actual",
+     xlab = "Actual Values", ylab = "Predicted Values", pch = 19)
+abline(0, 1, col = "red")
+
+# Plot the smooth terms
+par(mfrow = c(4, 6))  # Adjust this depending on the number of predictors
+plot(≈, pages = 1)
+
+# Function to calculate feature importance
+calc_feature_importance <- function(model, data) {
+  full_deviance <- summary(model)$dev.expl
+  importance <- numeric(length(names(data)[-1]))
+  names(importance) <- names(data)[-1]
+  
+  for (i in seq_along(importance)) {
+    reduced_formula <- as.formula(paste("fracR ~", 
+                                        paste("s(", names(data)[-c(1, i+1)], ")", 
+                                        collapse = " + ", sep = "")))
+    reduced_model <- gam(reduced_formula, data = data, family = betar)
+    importance[i] <- full_deviance - summary(reduced_model)$dev.expl
+  }
+  
+  return(importance)
+}
+
+# Calculate and sort feature importance
+feature_importance <- calc_feature_importance(gam_model, train_data)
+sorted_importance <- sort(feature_importance, decreasing = TRUE)
+
+# Plot feature importance
+barplot(sorted_importance, 
+        main = "Feature Importance in GAM Model",
+        xlab = "Features", 
+        ylab = "Reduction in Deviance Explained",
+        las = 2)
+```
+
+## Random Forest Regression
+```{r}
+set.seed(1234)
+# Load necessary libraries
+library(caret)
+library(randomForest)
+
+model_data <- merged_data_county[, c("fracR", dictionary$column_name)]
+# scale variables except the response variable
+model_data_scaled <- model_data %>%
+  mutate(across(-fracR, scale))
+
+# Split train and test dataset
+train_index <- sample(1:nrow(model_data_scaled), 0.7 * nrow(model_data_scaled))
+train_data <- model_data_scaled[train_index, ]
+test_data <- model_data_scaled[-train_index, ]
+
+# Fit the Random Forest Regression model
+rf_model <- randomForest(fracR ~ ., data = train_data, importance = TRUE)
+
+# Print the model summary
+print(rf_model)
+
+# Predict on the test set
+predictions <- predict(rf_model, newdata = test_data)
+
+# Evaluate the model performance
+mse <- mean((test_data$fracR - predictions)^2)
+rmse <- sqrt(mse)
+r2 <- cor(test_data$fracR, predictions)^2
+
+cat("Mean Squared Error: ", mse, "\n")
+cat("Root Mean Squared Error: ", rmse, "\n")
+cat("R-squared: ", r2, "\n")
+
+# Plot the predicted vs actual values
+plot(test_data$fracR, predictions, main = "Predicted vs Actual",
+     xlab = "Actual Values", ylab = "Predicted Values", pch = 19)
+abline(0, 1, col = "red")
+# plot feature importance
+importance <- importance(rf_model)
+varImpPlot(rf_model)
+
+```
+
+```{r}
+set.seed(1234)
+# Load necessary libraries
+library(caret)
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+
+model_data <- merged_data_county[, c("fracR", dictionary$column_name)]
+
+# Create a mapping of variable names to short descriptions
+var_descriptions <- c(
+  PST045214 = "Population 2014",
+  PST120214 = "Population change %",
+  POP010210 = "Population 2010",
+  AGE135214 = "Under 5 years %",
+  AGE295214 = "Under 18 years %",
+  AGE775214 = "65 years and over %",
+  SEX255214 = "Female %",
+  RHI125214 = "White %",
+  RHI225214 = "Black %",
+  RHI325214 = "American Indian %",
+  RHI425214 = "Asian %",
+  RHI525214 = "Pacific Islander %",
+  RHI625214 = "Two or More Races %",
+  RHI725214 = "Hispanic %",
+  RHI825214 = "White not Hispanic %",
+  POP715213 = "Same house 1 year+ %",
+  POP645213 = "Foreign born %",
+  POP815213 = "Non-English at home %",
+  EDU635213 = "High school grad %",
+  EDU685213 = "Bachelor's degree %",
+  VET605213 = "Veterans",
+  LFE305213 = "Mean travel time to work",
+  HSG010214 = "Housing units",
+  HSG445213 = "Homeownership rate",
+  HSG096213 = "Multi-unit structures %",
+  HSG495213 = "Median home value",
+  HSD410213 = "Households",
+  HSD310213 = "Persons per household",
+  INC910213 = "Per capita income",
+  INC110213 = "Median household income",
+  PVY020213 = "Poverty %",
+  BZA010213 = "Private establishments",
+  BZA110213 = "Private employment",
+  BZA115213 = "Private employment change %",
+  NES010213 = "Nonemployer establishments",
+  SBO001207 = "Total firms",
+  SBO315207 = "Black-owned firms %",
+  SBO115207 = "American Indian-owned firms %",
+  SBO215207 = "Asian-owned firms %",
+  SBO515207 = "Pacific Islander-owned firms %",
+  SBO415207 = "Hispanic-owned firms %",
+  SBO015207 = "Women-owned firms %",
+  MAN450207 = "Manufacturer shipments",
+  WTN220207 = "Wholesaler sales",
+  RTN130207 = "Retail sales",
+  RTN131207 = "Retail sales per capita",
+  AFN120207 = "Accommodation/food sales",
+  BPS030214 = "Building permits",
+  LND110210 = "Land area sq miles",
+  POP060210 = "Population density"
+)
+
+# Scale variables except the response variable
+model_data_scaled <- model_data %>%
+  mutate(across(-fracR, scale))
+
+# Split train and test dataset
+train_index <- sample(1:nrow(model_data_scaled), 0.7 * nrow(model_data_scaled))
+train_data <- model_data_scaled[train_index, ]
+test_data <- model_data_scaled[-train_index, ]
+
+# Fit the Random Forest Regression model
+rf_model <- randomForest(fracR ~ ., data = train_data, importance = TRUE)
+
+# Print the model summary
+print(rf_model)
+
+# Predict on the test set
+predictions <- predict(rf_model, newdata = test_data)
+
+# Evaluate the model performance
+mse <- mean((test_data$fracR - predictions)^2)
+rmse <- sqrt(mse)
+r2 <- cor(test_data$fracR, predictions)^2
+cat("Mean Squared Error: ", mse, "\n")
+cat("Root Mean Squared Error: ", rmse, "\n")
+cat("R-squared: ", r2, "\n")
+
+# Plot the predicted vs actual values
+plot(test_data$fracR, predictions, main = "Predicted vs Actual",
+     xlab = "Actual Values", ylab = "Predicted Values", pch = 19)
+abline(0, 1, col = "red")
+
+# Get feature importance
+importance <- importance(rf_model)
+
+# Create a data frame with importance scores and variable names
+imp_df <- data.frame(
+  variable = rownames(importance),
+  importance = importance[, "%IncMSE"],
+  stringsAsFactors = FALSE
+)
+
+# Replace variable names with short descriptions
+imp_df$variable <- var_descriptions[imp_df$variable]
+
+# Sort by importance
+imp_df <- imp_df[order(-imp_df$importance), ]
+
+# Select top 20 features
+top_10 <- head(imp_df, 10)
+
+# Create the ggplot
+ggplot(top_10, aes(x = reorder(variable, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 20 Feature Importance",
+       x = "Features",
+       y = "Importance (%IncMSE)") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8))
+
+# Save the plot
+ggsave("feature_importance_plot.png", width = 10, height = 8)
+
+cat("Feature importance plot has been saved as 'feature_importance_plot.png'\n")
+
+# Create a data frame with importance scores and variable names
+imp_df <- data.frame(
+  variable = rownames(importance),
+  importance = importance[, "%IncMSE"],
+  stringsAsFactors = FALSE
+)
+
+# Replace variable names with short descriptions
+imp_df$variable <- var_descriptions[imp_df$variable]
+
+# Sort by importance
+imp_df <- imp_df[order(-imp_df$importance), ]
+
+# Select top 10 features
+top_10 <- head(imp_df, 10)
+
+# Create PDP plots for top 10 features
+pdp_plots <- list()
+for(i in 1:10) {
+  feature <- rownames(importance)[order(-importance[,"%IncMSE"])][i]
+  pdp <- partial(rf_model, pred.var = feature, train = train_data)
+  
+  p <- ggplot(pdp, aes(x = get(feature), y = yhat)) +
+    geom_line() +
+    theme_minimal() +
+    labs(x = var_descriptions[feature],
+         y = "Partial Dependence",
+         title = paste("PDP for", var_descriptions[feature])) +
+    theme(plot.title = element_text(size = 10))
+  
+  pdp_plots[[i]] <- p
+}
+
+# Arrange PDPs in a grid
+pdp_grid <- do.call(gridExtra::grid.arrange, c(pdp_plots, ncol = 3))
+
+# Save the PDP grid
+ggsave("pdp_plots_top_10.png", pdp_grid, width = 15, height = 15, dpi = 300)
+
+cat("PDP plots for top 10 features have been saved as 'pdp_plots_top_10.png'\n")
+```
+
+## XGBoost
+```{r}
+library(xgboost)
+set.seed(1234)
+model_data <- merged_data_county_transformed[, c("fracR", selected_columns)]
+model_data_scaled <- model_data %>%
+  mutate(across(-fracR, scale))
+
+# split train and test data
+train_index <- sample(1:nrow(model_data), 0.7 * nrow(model_data))
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+model_xgboost <- xgboost(data = as.matrix(model_data[, -1]), 
+                 label = model_data$fracR,
+                 nrounds = 100, objective = "reg:squarederror")
+# Make predictions
+predictions <- predict(model_xgboost, as.matrix(test_data[, -1]))
+# Evaluate the model performance
+mse <- mean((test_data$fracR - predictions)^2)
+rmse <- sqrt(mse)
+r2 <- cor(test_data$fracR, predictions)^2
+# Print the evaluation metrics
+cat("Mean Squared Error: ", mse, "\n")
+cat("Root Mean Squared Error: ", rmse, "\n")
+cat("R-squared: ", r2, "\n")
+#plot the predicted vs actual values
+plot(test_data$fracR, predictions, main = "Predicted vs Actual",
+     xlab = "Actual Values", ylab = "Predicted Values", pch = 19)
+abline(0, 1, col = "red")
+
+importance <- xgb.importance(feature_names = colnames(model_data)[-1], model = model_xgboost)
+#plot the feature importance
+xgb.plot.importance(importance_matrix = importance)
+```
+## SVR
+```{r}
+library(e1071)
+library(dplyr)
+library(caret)  # For data splitting
+
+# Assuming model_data_scaled is already prepared as shown in your code
+
+# Set a seed for reproducibility
+set.seed(1234)
+
+# Split the data into training (80%) and test (20%) sets
+train_indices <- createDataPartition(model_data_scaled$fracR, p = 0.7, list = FALSE)
+train_data <- model_data_scaled[train_indices, ]
+test_data <- model_data_scaled[-train_indices, ]
+
+# Split the training data into features (X) and target variable (y)
+X_train <- train_data[, -which(names(train_data) == "fracR")]
+y_train <- train_data$fracR
+
+# Split the test data into features (X) and target variable (y)
+X_test <- test_data[, -which(names(test_data) == "fracR")]
+y_test <- test_data$fracR
+
+# Fit the SVR model on the training data
+svr_model <- svm(x = X_train, y = y_train, kernel = "radial", type = "eps-regression")
+
+# Print a summary of the model
+print(summary(svr_model))
+
+# Make predictions on the training data
+train_predictions <- predict(svr_model, X_train)
+
+# Make predictions on the test data
+test_predictions <- predict(svr_model, X_test)
+
+# Calculate the Mean Squared Error (MSE) for both training and test sets
+train_mse <- mean((y_train - train_predictions)^2)
+test_mse <- mean((y_test - test_predictions)^2)
+
+print(paste("Training Mean Squared Error:", train_mse))
+print(paste("Test Mean Squared Error:", test_mse))
+
+# Calculate the R-squared value for both training and test sets
+train_sst <- sum((y_train - mean(y_train))^2)
+train_sse <- sum((y_train - train_predictions)^2)
+train_r_squared <- 1 - (train_sse / train_sst)
+
+test_sst <- sum((y_test - mean(y_test))^2)
+test_sse <- sum((y_test - test_predictions)^2)
+test_r_squared <- 1 - (test_sse / test_sst)
+
+print(paste("Training R-squared:", train_r_squared))
+print(paste("Test R-squared:", test_r_squared))
+
+# Model summary
+print(summary(svr_model))
+
+# Residual plots
+residuals_train <- y_train - train_predictions
+residuals_test <- y_test - test_predictions
+
+plot(train_predictions, residuals_train, main="Residuals vs Fitted (Train)", 
+     xlab="Fitted values", ylab="Residuals")
+abline(h=0, col="red")
+
+plot(test_predictions, residuals_test, main="Residuals vs Fitted (Test)", 
+     xlab="Fitted values", ylab="Residuals")
+abline(h=0, col="red")
+
+# Function to calculate RMSE
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+# Function to calculate permutation importance
+calculate_importance <- function(model, X, y, n_repeats = 10) {
+  baseline_error <- rmse(y, predict(model, X))
+  importance_scores <- numeric(ncol(X))
+  names(importance_scores) <- colnames(X)
+  
+  for (i in 1:ncol(X)) {
+    feature_importance <- 0
+    for (j in 1:n_repeats) {
+      X_permuted <- X
+      X_permuted[, i] <- sample(X_permuted[, i])
+      permuted_error <- rmse(y, predict(model, X_permuted))
+      feature_importance <- feature_importance + (permuted_error - baseline_error)
+    }
+    importance_scores[i] <- feature_importance / n_repeats
+  }
+  
+  return(importance_scores)
+}
+
+# Calculate importance scores
+importance_scores <- calculate_importance(svr_model, X_train, y_train)
+
+# Sort and print importance scores
+sorted_importance <- sort(importance_scores, decreasing = TRUE)
+print(sorted_importance)
+
+# Plot importance scores
+barplot(sorted_importance, 
+        main = "Feature Importance", 
+        xlab = "Features", 
+        ylab = "Importance", 
+        las = 2, 
+        cex.names = 0.7)
+```
+
